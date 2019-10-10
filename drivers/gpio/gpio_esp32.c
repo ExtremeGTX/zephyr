@@ -31,7 +31,8 @@ struct gpio_esp32_data {
 			volatile u32_t *clear_reg;
 		} write;
 		struct {
-			volatile u32_t *reg;
+			volatile u32_t *input_reg;
+			volatile u32_t *output_reg;
 		} read;
 		struct {
 			volatile u32_t *status_reg;
@@ -50,28 +51,22 @@ static int convert_int_type(int flags)
 	 * GPIO matrix"; "GPIO_PINn_INT_TYPE".
 	 */
 
-	if (!(flags & GPIO_INT)) {
+	if (!(flags & GPIO_INT_ENABLE)) {
 		return 0;	/* Disables interrupt for a pin. */
 	}
 
 	if ((flags & GPIO_INT_EDGE) == GPIO_INT_EDGE) {
-		if ((flags & GPIO_INT_ACTIVE_HIGH) == GPIO_INT_ACTIVE_HIGH) {
-			return 1;
-		}
-
-		if ((flags & GPIO_INT_DOUBLE_EDGE) == GPIO_INT_DOUBLE_EDGE) {
+		if ((flags & GPIO_INT_EDGE_BOTH) == GPIO_INT_EDGE_BOTH) {
 			return 3;
 		}
-
-		return 2;	/* Defaults to falling edge. */
-	}
-
-	if ((flags & GPIO_INT_EDGE) == GPIO_INT_LEVEL) {
-		if ((flags & GPIO_INT_ACTIVE_HIGH) == GPIO_INT_ACTIVE_HIGH) {
-			return 5;
+		if ((flags & GPIO_INT_HIGH_1) == GPIO_INT_HIGH_1) {
+			return 1;
 		}
-
-		return 4;	/* Defaults to low level. */
+		return 2;       /* Defaults to falling edge. GPIO_INT_LOW_0 */
+	} else if ((flags & GPIO_INT_HIGH_1) == GPIO_INT_HIGH_1) {
+		return 5;
+	} else {
+		return 4;	/* Defaults to low level. GPIO_INT_LOW_0 */
 	}
 
 	/* Any other type of interrupt triggering is invalid. */
@@ -83,37 +78,11 @@ static inline u32_t *gpio_pin_reg(int pin)
 	return (u32_t *)(GPIO_PIN0_REG + pin * 4);
 }
 
-static int config_interrupt(u32_t pin, int flags)
-{
-	volatile u32_t *reg = gpio_pin_reg(pin);
-	int type = convert_int_type(flags);
-	u32_t v;
-	unsigned int key;
-
-	if (type < 0) {
-		return type;
-	}
-
-	key = irq_lock();
-
-	v = *reg;
-	v &= ~(GPIO_PIN_INT_ENA_M | GPIO_PIN_INT_TYPE_M);
-	/* Bit 3 of INT_ENA will enable interrupts on CPU 0 */
-	v |= (1<<2) << GPIO_PIN_INT_ENA_S;
-	/* Interrupt triggering mode */
-	v |= type << GPIO_PIN_INT_TYPE_S;
-	*reg = v;
-
-	irq_unlock(key);
-
-	return 0;
-}
-
 static void config_polarity(u32_t pin, int flags)
 {
 	volatile u32_t *reg = (u32_t *)(GPIO_FUNC0_IN_SEL_CFG_REG + pin * 4U);
 
-	if (flags & GPIO_POL_INV) {
+	if (flags & GPIO_ACTIVE_LOW) {
 		*reg |= BIT(GPIO_FUNC0_IN_INV_SEL_S);
 	} else {
 		*reg &= ~BIT(GPIO_FUNC0_IN_INV_SEL_S);
@@ -124,7 +93,7 @@ static void config_drive_strength(u32_t pin, int flags)
 {
 	volatile u32_t *reg = gpio_pin_reg(pin);
 
-	if ((flags & GPIO_DS_DISCONNECT_LOW) == GPIO_DS_DISCONNECT_LOW) {
+	if ((flags & GPIO_OPEN_SOURCE) == GPIO_OPEN_SOURCE) {
 		*reg |= GPIO_PIN_PAD_DRIVER;
 	} else {
 		*reg &= ~GPIO_PIN_PAD_DRIVER;
@@ -137,37 +106,44 @@ static int gpio_esp32_config(struct device *dev, int access_op,
 	struct gpio_esp32_data *data = dev->driver_data;
 	u32_t func;
 	int r;
+	u32_t io_pin = pin + data->port.pin_offset; /* Range from 0 - 39 */
 
 	if (access_op != GPIO_ACCESS_BY_PIN) {
 		return -ENOTSUP;
 	}
 
 	/* Query pinmux to validate pin number. */
-	r = pinmux_pin_get(data->pinmux, pin, &func);
+	r = pinmux_pin_get(data->pinmux, io_pin, &func);
 	if (r < 0) {
 		return r;
 	}
 
-	pinmux_pin_set(data->pinmux, pin, PIN_FUNC_GPIO);
-	if (flags & GPIO_PUD_PULL_UP) {
-		pinmux_pin_pullup(data->pinmux, pin, PINMUX_PULLUP_ENABLE);
-	} else if (flags & GPIO_PUD_PULL_DOWN) {
-		pinmux_pin_pullup(data->pinmux, pin, PINMUX_PULLUP_DISABLE);
+	pinmux_pin_set(data->pinmux, io_pin, PIN_FUNC_GPIO);
+	if (flags & GPIO_PULL_UP) {
+		pinmux_pin_pullup(data->pinmux, io_pin, PINMUX_PULLUP_ENABLE);
+	} else if (flags & GPIO_PULL_DOWN) {
+		pinmux_pin_pullup(data->pinmux, io_pin, PINMUX_PULLUP_DISABLE);
 	}
 
-	if (flags & GPIO_DIR_OUT) {
-		r = pinmux_pin_input_enable(data->pinmux, pin,
-					PINMUX_OUTPUT_ENABLED);
+	if (flags & GPIO_OUTPUT) {
+		r = pinmux_pin_input_enable(data->pinmux, io_pin,
+					    PINMUX_OUTPUT_ENABLED);
 		assert(r >= 0);
 	} else {
-		pinmux_pin_input_enable(data->pinmux, pin,
+		pinmux_pin_input_enable(data->pinmux, io_pin,
 					PINMUX_INPUT_ENABLED);
-		config_polarity(pin, flags);
+		config_polarity(io_pin, flags);
 	}
 
-	config_drive_strength(pin, flags);
+	config_drive_strength(io_pin, flags);
 
-	return config_interrupt(pin, flags);
+	if (flags & GPIO_OUTPUT_INIT_HIGH) {
+		*data->port.write.set_reg = BIT(pin);
+	} else if (flags & GPIO_OUTPUT_INIT_LOW) {
+		*data->port.write.clear_reg = BIT(pin);
+	}
+
+	return 0;
 }
 
 static int gpio_esp32_write(struct device *dev, int access_op,
@@ -200,8 +176,97 @@ static int gpio_esp32_read(struct device *dev, int access_op,
 		return -ENOTSUP;
 	}
 
-	v = *data->port.read.reg;
+	v = *data->port.read.input_reg;
 	*value = !!(v & BIT(pin - data->port.pin_offset));
+
+	return 0;
+}
+
+static int gpio_esp32_port_get_raw(struct device *port, u32_t *value)
+{
+	struct gpio_esp32_data *data = port->driver_data;
+
+	*value = *data->port.read.input_reg;
+
+	return 0;
+}
+
+static int gpio_esp32_port_set_masked_raw(struct device *port,
+					  u32_t mask, u32_t value)
+{
+	struct gpio_esp32_data *data = port->driver_data;
+
+	*data->port.write.set_reg = (*data->port.read.output_reg & ~mask)
+				    | (mask & value);
+
+	return 0;
+}
+
+static int gpio_esp32_port_set_bits_raw(struct device *port,
+					u32_t pins)
+{
+	struct gpio_esp32_data *data = port->driver_data;
+
+	*data->port.write.set_reg = pins;
+
+	return 0;
+}
+
+static int gpio_esp32_port_clear_bits_raw(struct device *port,
+					  u32_t pins)
+{
+	struct gpio_esp32_data *data = port->driver_data;
+
+	*data->port.write.clear_reg = pins;
+
+	return 0;
+}
+
+static int gpio_esp32_port_toggle_bits(struct device *port,
+				       u32_t pins)
+{
+	struct gpio_esp32_data *data = port->driver_data;
+
+	*data->port.write.clear_reg = *data->port.read.output_reg;
+	*data->port.write.set_reg = (*data->port.read.output_reg ^ pins);
+
+	return 0;
+}
+
+static int gpio_esp32_pin_interrupt_configure(struct device *port,
+					      unsigned int pin,
+					      enum gpio_int_mode mode,
+					      enum gpio_int_trig trig)
+{
+	struct gpio_esp32_data *data = port->driver_data;
+	u32_t io_pin = pin + data->port.pin_offset; /* Range from 0 - 39 */
+
+	if (mode & GPIO_INT_ENABLE) {
+		data->cb_pins |= BIT(pin);
+	} else {
+		data->cb_pins &= ~BIT(pin);
+	}
+
+	volatile u32_t *reg = gpio_pin_reg(io_pin);
+	int type = convert_int_type((mode | trig));
+	u32_t v;
+	unsigned int key;
+
+	if (type < 0) {
+		return type;
+	}
+
+	key = irq_lock();
+
+	v = *reg;
+	v &= ~(GPIO_PIN_INT_ENA_M | GPIO_PIN_INT_TYPE_M);
+	/* Bit 3 of INT_ENA will enable interrupts on CPU 0 */
+	v |= (1 << 2) << GPIO_PIN_INT_ENA_S;
+	/* Interrupt triggering mode */
+	v |= type << GPIO_PIN_INT_TYPE_S;
+	*reg = v;
+
+	irq_unlock(key);
 
 	return 0;
 }
@@ -288,6 +353,12 @@ static const struct gpio_driver_api gpio_esp32_driver = {
 	.config = gpio_esp32_config,
 	.write = gpio_esp32_write,
 	.read = gpio_esp32_read,
+	.port_get_raw = gpio_esp32_port_get_raw,
+	.port_set_masked_raw = gpio_esp32_port_set_masked_raw,
+	.port_set_bits_raw = gpio_esp32_port_set_bits_raw,
+	.port_clear_bits_raw = gpio_esp32_port_clear_bits_raw,
+	.port_toggle_bits = gpio_esp32_port_toggle_bits,
+	.pin_interrupt_configure = gpio_esp32_pin_interrupt_configure,
 	.manage_callback = gpio_esp32_manage_callback,
 	.enable_callback = gpio_esp32_enable_callback,
 	.disable_callback = gpio_esp32_disable_callback,
@@ -301,7 +372,8 @@ static struct gpio_esp32_data gpio_data_pins_0_to_31 = {
 			.clear_reg = (u32_t *)GPIO_OUT_W1TC_REG,
 		},
 		.read = {
-			.reg = (u32_t *)GPIO_IN_REG,
+			.input_reg = (u32_t *)GPIO_IN_REG,
+			.output_reg = (u32_t *)GPIO_OUT_REG,
 		},
 		.irq = {
 			.status_reg = (u32_t *)GPIO_STATUS_REG,
@@ -320,7 +392,8 @@ static struct gpio_esp32_data gpio_data_pins_32_to_39 = {
 			.clear_reg = (u32_t *)GPIO_OUT1_W1TC_REG,
 		},
 		.read = {
-			.reg = (u32_t *)GPIO_IN1_REG,
+			.input_reg = (u32_t *)GPIO_IN1_REG,
+			.output_reg = (u32_t *)GPIO_OUT1_REG,
 		},
 		.irq = {
 			.status_reg = (u32_t *)GPIO_STATUS1_REG,
