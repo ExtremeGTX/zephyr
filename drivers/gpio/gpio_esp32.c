@@ -118,6 +118,16 @@ static int gpio_esp32_config(struct device *dev, int access_op,
 		return r;
 	}
 
+	if (flags & GPIO_OUTPUT_INIT_HIGH) {
+		*data->port.write.set_reg = BIT(pin);
+		if (io_pin > 31)
+			printk("PIN_CONF: %d HIGH (IO_MUX_32:%x)\n",io_pin,*((u32_t*)(DR_REG_IO_MUX_BASE +0x1c)));
+	} else if (flags & GPIO_OUTPUT_INIT_LOW) {
+		*data->port.write.clear_reg = BIT(pin);
+		if (io_pin > 31)
+			printk("PIN_CONF: %d LOW  (IO_MUX_32:%x)\n",io_pin,*((u32_t*)(DR_REG_IO_MUX_BASE +0x1c)));
+	}
+
 	pinmux_pin_set(data->pinmux, io_pin, PIN_FUNC_GPIO);
 	if (flags & GPIO_PULL_UP) {
 		pinmux_pin_pullup(data->pinmux, io_pin, PINMUX_PULLUP_ENABLE);
@@ -132,16 +142,11 @@ static int gpio_esp32_config(struct device *dev, int access_op,
 	} else {
 		pinmux_pin_input_enable(data->pinmux, io_pin,
 					PINMUX_INPUT_ENABLED);
+		printk("PIN_CONF: %d INP (IO_MUX:%x)\n",io_pin,*((u32_t*)(DR_REG_IO_MUX_BASE +0x14)));
 		config_polarity(io_pin, flags);
 	}
 
 	config_drive_strength(io_pin, flags);
-
-	if (flags & GPIO_OUTPUT_INIT_HIGH) {
-		*data->port.write.set_reg = BIT(pin);
-	} else if (flags & GPIO_OUTPUT_INIT_LOW) {
-		*data->port.write.clear_reg = BIT(pin);
-	}
 
 	return 0;
 }
@@ -185,8 +190,9 @@ static int gpio_esp32_read(struct device *dev, int access_op,
 static int gpio_esp32_port_get_raw(struct device *port, u32_t *value)
 {
 	struct gpio_esp32_data *data = port->driver_data;
-
 	*value = *data->port.read.input_reg;
+//	printk("PORT_GET:0x%x, val:0x%x\n",*((u32_t*)GPIO_IN_REG),*value);
+	printk("PORT_GET: IN1:0x%x OUT1:0x%x\n",*((u32_t*)GPIO_IN1_REG),*((u32_t*)GPIO_OUT1_REG));
 
 	return 0;
 }
@@ -195,9 +201,13 @@ static int gpio_esp32_port_set_masked_raw(struct device *port,
 					  u32_t mask, u32_t value)
 {
 	struct gpio_esp32_data *data = port->driver_data;
-
-	*data->port.write.set_reg = (*data->port.read.output_reg & ~mask)
+	u32_t key;
+	
+	key = irq_lock();
+	*data->port.read.output_reg = (*data->port.read.output_reg & ~mask)
 				    | (mask & value);
+	irq_unlock(key);
+	printk("PORT_SET:0x%x, mask:0x%x val:0x%x\n",*data->port.write.set_reg,mask,value);
 
 	return 0;
 }
@@ -208,7 +218,7 @@ static int gpio_esp32_port_set_bits_raw(struct device *port,
 	struct gpio_esp32_data *data = port->driver_data;
 
 	*data->port.write.set_reg = pins;
-
+	printk("PORT_SET_BITS:0x%x\n",pins);
 	return 0;
 }
 
@@ -218,7 +228,7 @@ static int gpio_esp32_port_clear_bits_raw(struct device *port,
 	struct gpio_esp32_data *data = port->driver_data;
 
 	*data->port.write.clear_reg = pins;
-
+	printk("PORT_CLEAR:0x%x\n",pins);
 	return 0;
 }
 
@@ -226,9 +236,11 @@ static int gpio_esp32_port_toggle_bits(struct device *port,
 				       u32_t pins)
 {
 	struct gpio_esp32_data *data = port->driver_data;
-
-	*data->port.write.clear_reg = *data->port.read.output_reg;
-	*data->port.write.set_reg = (*data->port.read.output_reg ^ pins);
+	u32_t key;
+	
+	key = irq_lock();
+	*data->port.read.output_reg = (*data->port.read.output_reg ^ pins);
+	irq_unlock(key);
 
 	return 0;
 }

@@ -13,12 +13,39 @@
 
 	aliases {
 		uart-0 = &uart0;
+		sw0 = &b_button;
+		led0 = &blue_led;
 	};
 
 	chosen {
 		zephyr,sram = &sram0;
 		zephyr,console = &uart0;
 		zephyr,shell-uart = &uart0;
+	};
+	
+	leds {
+		compatible = "gpio-leds";
+		blue_led: led {
+			gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
+			label = "Status Led";
+		};
+	};
+
+	gpio_keys {
+		compatible = "gpio-keys";
+
+		a_button: a_button {
+			label = "A";
+			gpios = <&gpio1 7 GPIO_ACTIVE_LOW>;
+		};
+		b_button: b_button {
+			label = "B";
+			gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;
+		};
+		c_button: c_button {
+			label = "C";
+			gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;
+		};
 	};
 };
 
