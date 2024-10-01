@@ -1,6 +1,11 @@
 # Copyright (c) 2016 Wind River Systems, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+config USB_MTP
+	bool "USB Media Transfer Protocol Device Class support"
+	help
+	  USB Media Transfer Protocol Device Class support
+
 menuconfig USB_MASS_STORAGE
 	bool "USB Mass Storage Device Class support"
 	select DISK_ACCESS

@@ -1,0 +1,824 @@
+/* mtp_device.c */
+
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/init.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/usb/usb_device.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(mtp_device, 4);
+
+/* Define USB Base Class Code for Image devices */
+#define USB_BCC_IMAGE 0x06
+
+/* Endpoint addresses */
+#define MTP_IN_EP_ADDR        0x81  /* Bulk IN */
+#define MTP_OUT_EP_ADDR       0x01  /* Bulk OUT */
+#define MTP_INTR_EP_ADDR      0x82  /* Interrupt IN */
+
+/* Maximum packet size */
+#define MTP_BULK_EP_MPS       64
+#define MTP_INTR_EP_MPS       16
+
+/* MTP Container Types */
+#define MTP_CONTAINER_UNDEFINED 0x0000
+#define MTP_CONTAINER_COMMAND   0x0001
+#define MTP_CONTAINER_DATA      0x0002
+#define MTP_CONTAINER_RESPONSE  0x0003
+#define MTP_CONTAINER_EVENT     0x0004
+
+/* MTP Operation Codes */
+#define MTP_OP_GET_DEVICE_INFO      0x1001
+#define MTP_OP_OPEN_SESSION         0x1002
+#define MTP_OP_CLOSE_SESSION        0x1003
+#define MTP_OP_GET_STORAGE_IDS      0x1004
+#define MTP_OP_GET_STORAGE_INFO     0x1005
+#define MTP_OP_GET_NUM_OBJECTS      0x1006
+#define MTP_OP_GET_OBJECT_HANDLES   0x1007
+#define MTP_OP_GET_OBJECT_INFO      0x1008
+#define MTP_OP_GET_OBJECT           0x1009
+/* Add more operation codes as needed */
+
+/* MTP Response Codes */
+#define MTP_RESP_OK                 0x2001
+#define MTP_RESP_GENERAL_ERROR      0x2002
+#define MTP_RESP_SESSION_NOT_OPEN   0x2003
+#define MTP_RESP_SESSION_ALREADY_OPEN 0x201E
+#define MTP_RESP_INVALID_OBJECT_HANDLE 0x2009
+/* Add more response codes as needed */
+
+/* MTP Event Codes */
+#define MTP_EVENT_OBJECT_ADDED      0x4002
+/* Add more event codes as needed */
+
+/* MTP Class-Specific Request Codes */
+#define MTP_REQUEST_CANCEL            0x64
+#define MTP_REQUEST_GET_DEVICE_STATUS 0x67
+#define MTP_REQUEST_DEVICE_RESET      0x66
+#define MTP_REQUEST_GET_DEVICE_ID     0x65
+
+/* MTP Interface Descriptor */
+static const struct usb_if_descriptor mtp_interface = {
+    .bLength            = sizeof(struct usb_if_descriptor),
+    .bDescriptorType    = USB_DESC_INTERFACE,
+    .bInterfaceNumber   = 0x00,
+    .bAlternateSetting  = 0x00,
+    .bNumEndpoints      = 0x03,
+    .bInterfaceClass    = USB_BCC_IMAGE,
+    .bInterfaceSubClass = 0x01,  /* Still Image Capture */
+    .bInterfaceProtocol = 0x01,  /* Picture Transfer Protocol */
+    .iInterface         = 0x00,
+};
+
+/* Endpoint Descriptors */
+static const struct usb_ep_descriptor mtp_ep_in_desc = {
+    .bLength          = sizeof(struct usb_ep_descriptor),
+    .bDescriptorType  = USB_DESC_ENDPOINT,
+    .bEndpointAddress = MTP_IN_EP_ADDR,
+    .bmAttributes     = USB_DC_EP_BULK,
+    .wMaxPacketSize   = sys_cpu_to_le16(MTP_BULK_EP_MPS),
+    .bInterval        = 0x00,
+};
+
+static const struct usb_ep_descriptor mtp_ep_out_desc = {
+    .bLength          = sizeof(struct usb_ep_descriptor),
+    .bDescriptorType  = USB_DESC_ENDPOINT,
+    .bEndpointAddress = MTP_OUT_EP_ADDR,
+    .bmAttributes     = USB_DC_EP_BULK,
+    .wMaxPacketSize   = sys_cpu_to_le16(MTP_BULK_EP_MPS),
+    .bInterval        = 0x00,
+};
+
+static const struct usb_ep_descriptor mtp_ep_intr_desc = {
+    .bLength          = sizeof(struct usb_ep_descriptor),
+    .bDescriptorType  = USB_DESC_ENDPOINT,
+    .bEndpointAddress = MTP_INTR_EP_ADDR,
+    .bmAttributes     = USB_DC_EP_INTERRUPT,
+    .wMaxPacketSize   = sys_cpu_to_le16(MTP_INTR_EP_MPS),
+    .bInterval        = 0x06,
+};
+
+/* USB Descriptor Hierarchy */
+static const struct usb_desc_header *mtp_descriptors[] = {
+    (const struct usb_desc_header *)&mtp_interface,
+    (const struct usb_desc_header *)&mtp_ep_in_desc,
+    (const struct usb_desc_header *)&mtp_ep_out_desc,
+    (const struct usb_desc_header *)&mtp_ep_intr_desc,
+    NULL,
+};
+
+/* Endpoint Callbacks */
+static void mtp_bulk_in_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status);
+static void mtp_bulk_out_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status);
+static void mtp_intr_in_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status);
+
+/* Endpoint Configuration */
+static struct usb_ep_cfg_data mtp_ep_cfg[] = {
+    {
+        .ep_cb   = mtp_bulk_in_cb,
+        .ep_addr = MTP_IN_EP_ADDR,
+    },
+    {
+        .ep_cb   = mtp_bulk_out_cb,
+        .ep_addr = MTP_OUT_EP_ADDR,
+    },
+    {
+        .ep_cb   = mtp_intr_in_cb,
+        .ep_addr = MTP_INTR_EP_ADDR,
+    },
+};
+
+/* Forward declaration of class handler */
+static int mtp_class_handle_req(struct usb_setup_packet *setup,
+                                int32_t *len, uint8_t **data);
+
+static void mtp_status_cb(struct usb_cfg_data *cfg,
+				   enum usb_dc_status_code status,
+				   const uint8_t *param);
+
+/* USB Configuration Data */
+USBD_DEFINE_CFG_DATA(mtp_config) = {
+    .usb_device_description = NULL,
+    .interface_config = NULL,
+    .interface_descriptor = mtp_descriptors,
+    .cb_usb_status = mtp_status_cb,
+    .interface = {
+        .class_handler = mtp_class_handle_req,
+        .custom_handler = NULL,
+        .vendor_handler = NULL,
+    },
+    .num_endpoints = ARRAY_SIZE(mtp_ep_cfg),
+    .endpoint = mtp_ep_cfg,
+};
+
+/* MTP Session and Transaction Management */
+static bool mtp_session_open = false;
+static uint32_t mtp_session_id = 0;
+static uint32_t mtp_transaction_id = 0;
+
+/* Buffer for MTP data transfers */
+static uint8_t mtp_data_buffer[512];
+
+/* Define a structure for fake files */
+typedef struct {
+    uint32_t handle;
+    const char *filename;
+    uint64_t filesize;
+    uint16_t object_format;
+} mtp_object_t;
+
+/* Create an array of fake files */
+static mtp_object_t mtp_objects[] = {
+    {1, "file1.txt", 1024, 0x3000}, /* Undefined format */
+    {2, "file2.jpg", 2048, 0x3801}, /* JPEG file */
+    {3, "file3.mp3", 4096, 0x3009}, /* MP3 file */
+};
+
+#define NUM_MTP_OBJECTS (sizeof(mtp_objects) / sizeof(mtp_object_t))
+
+/* Helper function to convert ASCII strings to UTF-16LE */
+static uint32_t mtp_string_to_utf16(uint8_t *buf, const char *str)
+{
+    uint32_t len = strlen(str);
+    uint32_t total_len = 1 + (len * 2);
+
+    buf[0] = len + 1; /* Number of UTF-16 code units including null terminator */
+
+    for (uint32_t i = 0; i < len; i++) {
+        buf[1 + i * 2] = str[i];
+        buf[1 + i * 2 + 1] = 0x00;
+    }
+
+    /* Null terminator */
+    buf[1 + len * 2] = 0x00;
+    buf[1 + len * 2 + 1] = 0x00;
+
+    return total_len;
+}
+
+/* MTP Class-Specific Request Handlers */
+typedef int (*mtp_request_handler_t)(struct usb_setup_packet *setup, int32_t *len, uint8_t **data);
+
+typedef struct {
+    uint8_t request_code;
+    mtp_request_handler_t handler;
+} mtp_request_dispatch_t;
+
+static int mtp_handle_get_device_status(struct usb_setup_packet *setup, int32_t *len, uint8_t **data);
+static int mtp_handle_cancel_request(struct usb_setup_packet *setup, int32_t *len, uint8_t **data);
+static int mtp_handle_device_reset(struct usb_setup_packet *setup, int32_t *len, uint8_t **data);
+static int mtp_handle_get_device_id(struct usb_setup_packet *setup, int32_t *len, uint8_t **data);
+
+/* Dispatch table */
+static const mtp_request_dispatch_t mtp_request_table[] = {
+    { MTP_REQUEST_GET_DEVICE_STATUS, mtp_handle_get_device_status },
+    { MTP_REQUEST_CANCEL,            mtp_handle_cancel_request },
+    { MTP_REQUEST_DEVICE_RESET,      mtp_handle_device_reset },
+    { MTP_REQUEST_GET_DEVICE_ID,     mtp_handle_get_device_id },
+    /* Add more requests as needed */
+};
+
+static int mtp_class_handle_req(struct usb_setup_packet *setup,
+                                int32_t *len, uint8_t **data)
+{
+    LOG_DBG("Class request: bmRequestType 0x%02x, bRequest 0x%02x",
+            setup->bmRequestType, setup->bRequest);
+
+    /* Find and execute the corresponding handler */
+    for (size_t i = 0; i < ARRAY_SIZE(mtp_request_table); i++) {
+        if (mtp_request_table[i].request_code == setup->bRequest) {
+            return mtp_request_table[i].handler(setup, len, data);
+        }
+    }
+
+    LOG_WRN("Unsupported MTP class request 0x%02x", setup->bRequest);
+    return -ENOTSUP;
+}
+
+/* Handler for GET_DEVICE_STATUS (0x67) */
+static int mtp_handle_get_device_status(struct usb_setup_packet *setup, int32_t *len, uint8_t **data)
+{
+    static uint8_t device_status[] = {
+        0x00, 0x00,       /* Reserved */
+        0x01, 0x00,       /* Device Status Code: OK */
+        0x00, 0x00        /* Reserved */
+    };
+
+    *data = device_status;
+    *len = sizeof(device_status);
+
+    LOG_DBG("GET_DEVICE_STATUS: Device is OK");
+    return 0;
+}
+
+/* Handler for CANCEL_REQUEST (0x64) */
+static int mtp_handle_cancel_request(struct usb_setup_packet *setup, int32_t *len, uint8_t **data)
+{
+    if (setup->wLength < 6) {
+        LOG_ERR("CANCEL_REQUEST: Invalid length");
+        return -EINVAL;
+    }
+
+    uint32_t transaction_id = sys_get_le32(&(*data)[2]);
+    LOG_DBG("CANCEL_REQUEST: Transaction ID %u", transaction_id);
+
+    /* Implement cancellation logic if necessary */
+
+    return 0;
+}
+
+/* Handler for DEVICE_RESET (0x66) */
+static int mtp_handle_device_reset(struct usb_setup_packet *setup, int32_t *len, uint8_t **data)
+{
+    LOG_INF("DEVICE_RESET: Resetting device");
+
+    /* Reset device state */
+    mtp_session_open = false;
+    mtp_session_id = 0;
+    mtp_transaction_id = 0;
+
+    return 0;
+}
+
+/* Handler for GET_DEVICE_ID (0x65) */
+static int mtp_handle_get_device_id(struct usb_setup_packet *setup, int32_t *len, uint8_t **data)
+{
+    static const uint8_t device_id[] = {
+        0x12, 0x01,       /* Length and type */
+        'Z', 0x00, 'e', 0x00, 'p', 0x00, 'h', 0x00,
+        'y', 0x00, 'r', 0x00, 'M', 0x00, 'T', 0x00, 'P', 0x00
+    };
+
+    *data = (uint8_t *)device_id;
+    *len = sizeof(device_id);
+
+    LOG_DBG("GET_DEVICE_ID: Sending device ID");
+    return 0;
+}
+
+/* MTP Operation Handlers */
+static int mtp_get_device_info(void);
+static int mtp_open_session(uint32_t session_id);
+static int mtp_close_session(void);
+static int mtp_get_storage_ids(void);
+static int mtp_get_storage_info(uint32_t storage_id);
+static int mtp_get_num_objects(void);
+static int mtp_get_object_handles(void);
+static int mtp_get_object_info(uint32_t object_handle);
+static int mtp_get_object(uint32_t object_handle);
+
+/* MTP Data Packet Handlers */
+static int mtp_handle_command(uint8_t *data, uint32_t length);
+
+/* Endpoint Callbacks Implementation */
+static void mtp_bulk_in_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status)
+{
+    LOG_DBG("Bulk IN callback, ep: 0x%02x, status: %d", ep, ep_status);
+    /* Handle IN transfer completion */
+}
+
+static void mtp_bulk_out_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status)
+{
+    LOG_DBG("Bulk OUT callback, ep: 0x%02x, status: %d", ep, ep_status);
+
+    uint32_t bytes_read = 0;
+    int ret;
+
+    /* Read data from the OUT endpoint */
+    ret = usb_read(ep, mtp_data_buffer, sizeof(mtp_data_buffer), &bytes_read);
+    if (ret != 0) {
+        LOG_ERR("Failed to read data (%d)", ret);
+        return;
+    }
+
+    LOG_DBG("Read %d bytes from host", bytes_read);
+
+    /* Handle the received MTP command */
+    mtp_handle_command(mtp_data_buffer, bytes_read);
+}
+
+static void mtp_intr_in_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status)
+{
+    LOG_DBG("Interrupt IN callback, ep: 0x%02x, status: %d", ep, ep_status);
+    /* Handle Interrupt IN transfer completion */
+}
+
+/* USB Status Callback */
+static void mtp_status_cb(struct usb_cfg_data *cfg,
+				   enum usb_dc_status_code status,
+				   const uint8_t *param)
+{
+    LOG_DBG("cfg %p status %d param %x", cfg, status, *param);
+
+    /* Handle USB status events */
+    switch (status) {
+	case USB_DC_ERROR:
+		LOG_DBG("USB device error");
+		break;
+	case USB_DC_RESET:
+		LOG_DBG("USB device reset detected");
+		break;
+	case USB_DC_CONNECTED:
+		LOG_DBG("USB device connected");
+		break;
+	case USB_DC_CONFIGURED:
+		LOG_DBG("USB device configured");
+		break;
+	case USB_DC_DISCONNECTED:
+		LOG_DBG("USB device disconnected");
+		break;
+	case USB_DC_SUSPEND:
+		LOG_DBG("USB device suspended");
+		break;
+	case USB_DC_RESUME:
+		LOG_DBG("USB device resumed");
+		break;
+	case USB_DC_INTERFACE:
+		LOG_DBG("USB interface selected");
+		break;
+	case USB_DC_SOF:
+		break;
+	case USB_DC_UNKNOWN:
+	default:
+		LOG_DBG("USB unknown state");
+		break;
+	}
+}
+
+/* MTP Send Data Function */
+static int mtp_send_data(uint8_t *buf, uint32_t len)
+{
+    int ret = usb_write(MTP_IN_EP_ADDR, buf, len, NULL);
+    if (ret < 0) {
+        LOG_ERR("Failed to send data (%d)", ret);
+        return ret;
+    }
+    return 0;
+}
+
+/* MTP Send Response Function */
+static int mtp_send_response(uint16_t response_code)
+{
+    uint8_t response[12];
+    sys_put_le32(12, &response[0]);                    /* Length */
+    sys_put_le16(MTP_CONTAINER_RESPONSE, &response[4]);/* Container Type */
+    sys_put_le16(response_code, &response[6]);         /* Response Code */
+    sys_put_le32(mtp_transaction_id, &response[8]);    /* Transaction ID */
+
+    return mtp_send_data(response, sizeof(response));
+}
+
+/* MTP Handle Command Function */
+static int mtp_handle_command(uint8_t *data, uint32_t length)
+{
+    if (length < 12) {
+        LOG_ERR("Invalid MTP command length");
+        return -EINVAL;
+    }
+
+    uint32_t container_length = sys_get_le32(&data[0]);
+    uint16_t container_type   = sys_get_le16(&data[4]);
+    uint16_t operation_code   = sys_get_le16(&data[6]);
+    mtp_transaction_id        = sys_get_le32(&data[8]);
+
+    LOG_DBG("MTP Command: OpCode 0x%04x, Transaction ID %u", operation_code, mtp_transaction_id);
+
+    switch (operation_code) {
+    case MTP_OP_GET_DEVICE_INFO:
+        return mtp_get_device_info();
+    case MTP_OP_OPEN_SESSION:
+        {
+            uint32_t session_id = sys_get_le32(&data[12]);
+            return mtp_open_session(session_id);
+        }
+    case MTP_OP_CLOSE_SESSION:
+        return mtp_close_session();
+    case MTP_OP_GET_STORAGE_IDS:
+        return mtp_get_storage_ids();
+    case MTP_OP_GET_STORAGE_INFO:
+        {
+            uint32_t storage_id = sys_get_le32(&data[12]);
+            return mtp_get_storage_info(storage_id);
+        }
+    case MTP_OP_GET_NUM_OBJECTS:
+        return mtp_get_num_objects();
+    case MTP_OP_GET_OBJECT_HANDLES:
+        return mtp_get_object_handles();
+    case MTP_OP_GET_OBJECT_INFO:
+        {
+            uint32_t object_handle = sys_get_le32(&data[12]);
+            return mtp_get_object_info(object_handle);
+        }
+    case MTP_OP_GET_OBJECT:
+        {
+            uint32_t object_handle = sys_get_le32(&data[12]);
+            return mtp_get_object(object_handle);
+        }
+    default:
+        LOG_WRN("Unsupported MTP operation 0x%04x", operation_code);
+        return mtp_send_response(MTP_RESP_GENERAL_ERROR);
+    }
+}
+
+/* MTP Operation Handlers Implementation */
+static int mtp_get_device_info(void)
+{
+    uint8_t buf[512];
+    uint32_t container_length;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+    uint32_t offset = 12;
+
+    /* Build MTP Container Header */
+    sys_put_le32(0, &buf[0]); /* Placeholder for length */
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_DEVICE_INFO, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* Fill Device Info Dataset */
+    sys_put_le16(100, &buf[offset]); /* Standard Version */
+    offset += 2;
+    sys_put_le32(6, &buf[offset]); /* Vendor Extension ID */
+    offset += 4;
+    sys_put_le16(100, &buf[offset]); /* Vendor Extension Version */
+    offset += 2;
+
+    /* Vendor Extension Description */
+    const char *vendor_desc = "Zephyr MTP Device";
+    offset += mtp_string_to_utf16(&buf[offset], vendor_desc);
+
+    /* Functional Mode */
+    sys_put_le16(0, &buf[offset]);
+    offset += 2;
+
+    /* Supported Operations */
+    uint16_t supported_ops[] = {
+        MTP_OP_GET_DEVICE_INFO,
+        MTP_OP_OPEN_SESSION,
+        MTP_OP_CLOSE_SESSION,
+        MTP_OP_GET_STORAGE_IDS,
+        MTP_OP_GET_STORAGE_INFO,
+        MTP_OP_GET_NUM_OBJECTS,
+        MTP_OP_GET_OBJECT_HANDLES,
+        MTP_OP_GET_OBJECT_INFO,
+        MTP_OP_GET_OBJECT,
+    };
+    uint32_t num_ops = ARRAY_SIZE(supported_ops);
+    sys_put_le32(num_ops, &buf[offset]);
+    offset += 4;
+    for (uint32_t i = 0; i < num_ops; i++) {
+        sys_put_le16(supported_ops[i], &buf[offset]);
+        offset += 2;
+    }
+
+    /* For simplicity, skip other optional fields */
+
+    /* Update container length */
+    container_length = offset;
+    sys_put_le32(container_length, &buf[0]);
+
+    /* Send the data over Bulk IN endpoint */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_open_session(uint32_t session_id)
+{
+    if (mtp_session_open) {
+        LOG_WRN("Session already open");
+        return mtp_send_response(MTP_RESP_SESSION_ALREADY_OPEN);
+    }
+
+    mtp_session_id = session_id;
+    mtp_session_open = true;
+
+    LOG_DBG("Session opened with ID: %u", mtp_session_id);
+
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_close_session(void)
+{
+    if (!mtp_session_open) {
+        LOG_WRN("No session open");
+        return mtp_send_response(MTP_RESP_SESSION_NOT_OPEN);
+    }
+
+    mtp_session_id = 0;
+    mtp_session_open = false;
+
+    LOG_DBG("Session closed");
+
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_get_storage_ids(void)
+{
+    uint8_t buf[32];
+    uint32_t container_length;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+    uint32_t offset = 12;
+
+    /* Build MTP Container Header */
+    sys_put_le32(0, &buf[0]); /* Placeholder for length */
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_STORAGE_IDS, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* Number of Storage IDs */
+    sys_put_le32(1, &buf[offset]); /* One storage ID */
+    offset += 4;
+
+    /* Storage ID */
+    sys_put_le32(0x00010001, &buf[offset]); /* Example Storage ID */
+    offset += 4;
+
+    /* Update container length */
+    container_length = offset;
+    sys_put_le32(container_length, &buf[0]);
+
+    /* Send the data */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_get_storage_info(uint32_t storage_id)
+{
+    uint8_t buf[256];
+    uint32_t container_length;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+    uint32_t offset = 12;
+
+    /* Build MTP Container Header */
+    sys_put_le32(0, &buf[0]); /* Placeholder for length */
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_STORAGE_INFO, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* StorageInfo Dataset */
+    sys_put_le16(0x0003, &buf[offset]); /* StorageType: Fixed RAM */
+    offset += 2;
+    sys_put_le16(0x0002, &buf[offset]); /* FilesystemType: Generic Flat */
+    offset += 2;
+    sys_put_le16(0x0000, &buf[offset]); /* AccessCapability: Read-Write */
+    offset += 2;
+    sys_put_le64(1024 * 1024, &buf[offset]); /* Max Capacity */
+    offset += 8;
+    sys_put_le64(512 * 1024, &buf[offset]); /* Free Space */
+    offset += 8;
+
+    /* Storage Description */
+    const char *storage_desc = "Internal Storage";
+    offset += mtp_string_to_utf16(&buf[offset], storage_desc);
+
+    /* Volume Label */
+    const char *volume_label = "ZephyrMTP";
+    offset += mtp_string_to_utf16(&buf[offset], volume_label);
+
+    /* Update container length */
+    container_length = offset;
+    sys_put_le32(container_length, &buf[0]);
+
+    /* Send the data */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_get_num_objects(void)
+{
+    uint8_t buf[16];
+    uint32_t container_length = 12 + 4;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+
+    /* Build MTP Container Header */
+    sys_put_le32(container_length, &buf[0]);
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_NUM_OBJECTS, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* Number of Objects */
+    sys_put_le32(NUM_MTP_OBJECTS, &buf[12]);
+
+    /* Send the data */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_get_object_handles(void)
+{
+    uint8_t buf[64];
+    uint32_t container_length;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+    uint32_t offset = 12;
+
+    /* Build MTP Container Header */
+    sys_put_le32(0, &buf[0]); /* Placeholder for length */
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_OBJECT_HANDLES, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* Number of Object Handles */
+    sys_put_le32(NUM_MTP_OBJECTS, &buf[offset]);
+    offset += 4;
+
+    /* Object Handles */
+    for (uint32_t i = 0; i < NUM_MTP_OBJECTS; i++) {
+        sys_put_le32(mtp_objects[i].handle, &buf[offset]);
+        offset += 4;
+    }
+
+    /* Update container length */
+    container_length = offset;
+    sys_put_le32(container_length, &buf[0]);
+
+    /* Send the data */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_get_object_info(uint32_t object_handle)
+{
+    mtp_object_t *obj = NULL;
+    for (uint32_t i = 0; i < NUM_MTP_OBJECTS; i++) {
+        if (mtp_objects[i].handle == object_handle) {
+            obj = &mtp_objects[i];
+            break;
+        }
+    }
+
+    if (!obj) {
+        LOG_ERR("Object not found");
+        return mtp_send_response(MTP_RESP_INVALID_OBJECT_HANDLE);
+    }
+
+    uint8_t buf[256];
+    uint32_t container_length;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+    uint32_t offset = 12;
+
+    /* Build MTP Container Header */
+    sys_put_le32(0, &buf[0]); /* Placeholder for length */
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_OBJECT_INFO, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* ObjectInfo Dataset */
+    sys_put_le32(0x00010001, &buf[offset]); /* StorageID */
+    offset += 4;
+    sys_put_le16(obj->object_format, &buf[offset]); /* Object Format */
+    offset += 2;
+    sys_put_le16(0x0000, &buf[offset]); /* Protection Status */
+    offset += 2;
+    sys_put_le32(obj->filesize, &buf[offset]); /* Object Compressed Size */
+    offset += 4;
+    sys_put_le16(0x0000, &buf[offset]); /* Thumb Format */
+    offset += 2;
+    sys_put_le32(0, &buf[offset]); /* Thumb Compressed Size */
+    offset += 4;
+    sys_put_le32(0, &buf[offset]); /* ThumbPixWidth */
+    offset += 4;
+    sys_put_le32(0, &buf[offset]); /* ThumbPixHeight */
+    offset += 4;
+    sys_put_le32(0, &buf[offset]); /* ImagePixWidth */
+    offset += 4;
+    sys_put_le32(0, &buf[offset]); /* ImagePixHeight */
+    offset += 4;
+    sys_put_le32(0, &buf[offset]); /* ImageBitDepth */
+    offset += 4;
+    sys_put_le32(0xFFFFFFFF, &buf[offset]); /* Parent Object */
+    offset += 4;
+    sys_put_le16(0, &buf[offset]); /* Association Type */
+    offset += 2;
+    sys_put_le32(0, &buf[offset]); /* Association Description */
+    offset += 4;
+    sys_put_le32(0, &buf[offset]); /* Sequence Number */
+    offset += 4;
+
+    /* Filename */
+    offset += mtp_string_to_utf16(&buf[offset], obj->filename);
+
+    /* Date Created */
+    offset += mtp_string_to_utf16(&buf[offset], "20220101T000000");
+
+    /* Date Modified */
+    offset += mtp_string_to_utf16(&buf[offset], "20220101T000000");
+
+    /* Keywords */
+    offset += mtp_string_to_utf16(&buf[offset], "");
+
+    /* Update container length */
+    container_length = offset;
+    sys_put_le32(container_length, &buf[0]);
+
+    /* Send the data */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
+
+static int mtp_get_object(uint32_t object_handle)
+{
+    mtp_object_t *obj = NULL;
+    for (uint32_t i = 0; i < NUM_MTP_OBJECTS; i++) {
+        if (mtp_objects[i].handle == object_handle) {
+            obj = &mtp_objects[i];
+            break;
+        }
+    }
+
+    if (!obj) {
+        LOG_ERR("Object not found");
+        return mtp_send_response(MTP_RESP_INVALID_OBJECT_HANDLE);
+    }
+
+    uint8_t buf[512];
+    uint32_t container_length = 12 + obj->filesize;
+    uint16_t container_type = MTP_CONTAINER_DATA;
+
+    /* Build MTP Container Header */
+    sys_put_le32(container_length, &buf[0]);
+    sys_put_le16(container_type, &buf[4]);
+    sys_put_le16(MTP_OP_GET_OBJECT, &buf[6]);
+    sys_put_le32(mtp_transaction_id, &buf[8]);
+
+    /* Fake file content (fill with zeros for simplicity) */
+    memset(&buf[12], 0x00, obj->filesize);
+
+    /* Send the data */
+    int ret = mtp_send_data(buf, container_length);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Send the Response */
+    return mtp_send_response(MTP_RESP_OK);
+}
