@@ -1,0 +1,18 @@
+# Copyright (c) 2022 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config USBD_MTP_CLASS
+	bool "USB MTP Class"
+	help
+	  USB Media Transfer Protocol Device Class support.
+	  Allow file transfer independent of storage file system.
+
+if USBD_MTP_CLASS
+module = USBD_MTP
+module-str = usbd mtp
+default-count = 1
+source "subsys/logging/Kconfig.template.log_config"
+
+rsource "Kconfig.template.instances_count"
+endif

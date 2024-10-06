@@ -30,8 +30,7 @@ static int cmd_enable_usb(const struct shell *sh, size_t argc, char **argv)
 int main(void)
 {
 	printf("Hello World! %s\n", CONFIG_BOARD_TARGET);
-	printf("Size of wchar is %u\n", sizeof(wchar_t));
 	return 0;
 }
 
-SHELL_CMD_ARG_REGISTER(enable_usb, NULL, "Show kernel version", cmd_enable_usb, 1, 0);
+SHELL_CMD_ARG_REGISTER(enable_usb, NULL, "Enable USB Subsys", cmd_enable_usb, 1, 0);

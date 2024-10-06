@@ -866,6 +866,7 @@ static struct udc_stm32_data udc0_priv;
 static struct udc_data udc0_data = {
 	.mutex = Z_MUTEX_INITIALIZER(udc0_data.mutex),
 	.priv = &udc0_priv,
+	.caps.hs = 1,
 };
 
 static const struct udc_stm32_config udc0_cfg  = {
@@ -887,12 +888,14 @@ static uint32_t usb_dc_stm32_get_maximum_speed(void)
 #define USB_OTG_SPEED_HIGH                     0U
 #define USB_OTG_SPEED_HIGH_IN_FULL             1U
 #endif /* CONFIG_SOC_SERIES_STM32L4X */
+
+#define ZEPHYR_USB_OTG_SPEED_HIGH 1
 /*
  * If max-speed is not passed via DT, set it to USB controller's
  * maximum hardware capability.
  */
 #if USB_OTG_HS_EMB_PHY || USB_OTG_HS_ULPI_PHY
-	uint32_t speed = USB_OTG_SPEED_HIGH;
+	uint32_t speed = ZEPHYR_USB_OTG_SPEED_HIGH;
 #else
 	uint32_t speed = USB_OTG_SPEED_FULL;
 #endif
@@ -951,6 +954,7 @@ static void priv_pcd_prepare(const struct device *dev)
 #else
 	priv->pcd.Init.phy_itface = PCD_PHY_EMBEDDED;
 #endif /* USB_OTG_HS_EMB_PHY */
+	LOG_WRN("DRIVER speed %u", priv->pcd.Init.speed);
 }
 
 static const struct stm32_pclken pclken[] = STM32_DT_INST_CLOCKS(0);

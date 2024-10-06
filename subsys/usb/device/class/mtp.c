@@ -442,7 +442,7 @@ static int mtp_class_handle_req(struct usb_setup_packet *setup,
             setup->bmRequestType, setup->bRequest);
 /**************************** */
     if (setup->bRequest == MTP_REQUEST_GET_DEVICE_STATUS) {
-        LOG_DBG(">MTP_REQUEST_GET_DEVICE_STATUS");
+        LOG_DBG(">MTP_REQUEST_GET_DEVICE_STATUS (IS THIS WORKING ?)");
         static struct mtp_device_status mtp_status = {
             .wLength = 4,
             .wCode = MTP_RESP_OK
