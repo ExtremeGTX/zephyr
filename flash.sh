@@ -1,0 +1,1 @@
+ west build -b stm32f769i_disco ./samples/subsys/usb/mtp/ && xcopy.exe $(wslpath -w ./build/zephyr/zephyr.bin) H:
