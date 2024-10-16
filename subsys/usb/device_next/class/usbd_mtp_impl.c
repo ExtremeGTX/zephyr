@@ -86,8 +86,11 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 #define STORAGE_TYPE_FIXED_RAM              0x0003
 #define STORAGE_TYPE_REMOVABLE_RAM          0x0004
 
-
-
+/* Object Protection */
+#define OBJECT_PROTECTION_NO	                0x0000
+#define OBJECT_PROTECTION_READ_ONLY	            0x0001
+#define OBJECT_PROTECTION_READ_ONLY_DATA	    0x8002
+#define OBJECT_PROTECTION_NON_TRANSFERRABLE     0x8003
 
 #define MTP_CMD(opcode) do {                    \
             mtp_##opcode(bufp, mtp_command);    \
@@ -128,28 +131,23 @@ struct mtp_device_info {
     uint16_t vendor_extension_desc[38];  // Vendor extension description in UTF-16LE
     uint16_t functional_mode;
     uint32_t operations_supported_count;
-#if EXTENDED_PROPERTIES
-    uint16_t operations_supported[27];  // Adjust size as needed
-#else
-    uint16_t operations_supported[23];
-#endif
+    uint16_t operations_supported[18];
     uint32_t events_count;
-    uint16_t events_supported[6];       // Adjust size as needed
+    uint16_t events_supported[6];
     uint32_t device_properties_count;
-    uint16_t device_properties_supported[1];  // Adjust size as needed
+    uint16_t device_properties_supported[1];
     uint32_t formats_count;
     uint32_t image_formats_count;
     uint16_t image_formats[2];
     uint8_t manufacturer_len;
-    uint16_t manufacturer[8];   // Manufacturer name (UTF-16LE, null-terminated)
+    uint16_t manufacturer[7];
     uint8_t model_len;
-    uint16_t model[10];          // Model name (UTF-16LE, null-terminated)
+    uint16_t model[10];
     uint8_t device_version_len;
-    uint16_t device_version[4]; // Device version (UTF-16LE, null-terminated)
+    uint16_t device_version[4];
     uint8_t serial_number_len;
-    uint16_t serial_number[17];  // Serial number (UTF-16LE, null-terminated)
+    uint16_t serial_number[17];
 } __packed;
-
 
 struct storage_info_t{
     uint16_t type;
@@ -164,6 +162,35 @@ struct storage_info_t{
     uint16_t volume_id_desc[9];
 } __packed;
 
+struct mtp_object_info {
+    uint32_t StorageID;                 // Example: 0x00010001 (Storage ID 1)
+    uint16_t ObjectFormat;              // Example: 0x3001 (Association/Folders)
+    uint16_t ProtectionStatus;          // Example: 0x0000 (No protection)
+    uint32_t ObjectCompressedSize;      // Example: 0x0000000000010000 (64KB)
+    uint16_t ThumbFormat;               // Example: 0x3801 (JPEG Thumbnail)
+    uint32_t ThumbCompressedSize;       // Example: 0x00002000 (8KB)
+    uint32_t ThumbPixWidth;             // Example: 128 pixels
+    uint32_t ThumbPixHeight;            // Example: 128 pixels
+    uint32_t ImagePixWidth;             // Example: 1920 pixels (Full Image Width)
+    uint32_t ImagePixHeight;            // Example: 1080 pixels (Full Image Height)
+    uint32_t ImageBitDepth;             // Example: 24-bit color depth
+    uint32_t ParentObject;              // Example: 0x00000000 (No parent)
+    uint16_t AssociationType;           // Example: 0x0001 (Folder)
+    uint32_t AssociationDesc;           // Example: 0x00000000 (No association desc)
+    uint32_t SequenceNumber;            // Example: 0x00000001 (First object)
+
+    uint8_t FileNameLength;
+    uint16_t FileName[9];               // Example: "SampleFile.jpg"
+
+    uint8_t DateCreatedLength;
+    uint16_t DateCreated[16];               // Example: 0x000000007FF00000 (Timestamp)
+
+    uint8_t DateModifiedLength;
+    uint16_t DateModified[16];              // Example: 0x000000007FF01000 (Timestamp)
+
+    uint8_t KeywordsLength;
+    uint16_t Keywords[0];               // Example: "Sample, Image"
+} __packed;
 
 static struct mtp_device_info device_info = {
     .standard_version = 100,            // MTP version 1.00
@@ -172,11 +199,7 @@ static struct mtp_device_info device_info = {
     .vendor_extension_desc_len = 38,    // Length in bytes, not characters
     .vendor_extension_desc = { 'm', 'i', 'c', 'r', 'o', 's', 'o', 'f', 't', '.', 'c', 'o', 'm', ':', ' ', '1', '.', '0', ';',' ','a','n','d','r','o','i','d','.','c','o','m',':',' ','1','.','0',';', '\0' },  // "microsoft.com: 1.0;" in UTF-16LE
     .functional_mode = 0,               // Standard mode
-#if EXTENDED_PROPERTIES
-    .operations_supported_count = 27,
-#else
-    .operations_supported_count = 23,
-#endif
+    .operations_supported_count = 18,
     .operations_supported = {
         MTP_OP_GET_DEVICE_INFO,
         MTP_OP_OPEN_SESSION,
@@ -187,24 +210,13 @@ static struct mtp_device_info device_info = {
         MTP_OP_GET_OBJECT_HANDLES,
         MTP_OP_GET_OBJECT_INFO,
         MTP_OP_GET_OBJECT,
-        MTP_OP_GET_THUMB,
         MTP_OP_DELETE_OBJECT,
         MTP_OP_SEND_OBJECT_INFO,
         MTP_OP_SEND_OBJECT,
         MTP_OP_RESET_DEVICE,
-        MTP_OP_GET_DEVICE_PROP_DESC,
-        MTP_OP_GET_DEVICE_PROP_VALUE,
-        MTP_OP_SET_DEVICE_PROP_VALUE,
-        MTP_OP_RESET_DEVICE_PROP_VALUE,
         MTP_OP_MOVE_OBJECT,
         MTP_OP_COPY_OBJECT,
         MTP_OP_GET_PARTIAL_OBJECT,
-#if EXTENDED_PROPERTIES
-        MTP_OP_GET_OBJECT_PROPS_SUPPORTED,
-        MTP_OP_GET_OBJECT_PROP_DESC,
-        MTP_OP_GET_OBJECT_PROP_VALUE,
-        MTP_OP_SET_OBJECT_PROP_VALUE,
-#endif
         MTP_OP_SET_OBJECT_REFERENCES,
         MTP_OP_SKIP
     },
@@ -227,8 +239,8 @@ static struct mtp_device_info device_info = {
         MTP_FORMAT_ASSOCIATION,
         MTP_FORMAT_TEXT
     },
-    .manufacturer_len = 8,               // "My Manufacturer" is 14 characters
-    .manufacturer = { 'Z', 'e', 'p', 'h', 'y', 'e', 'r', '\0' },
+    .manufacturer_len = 7,
+    .manufacturer = { 'Z', 'e', 'p', 'h', 'y', 'r', '\0' },
     .model_len = 10,                       // "My Model" is 8 characters
     .model = { 'Z', 'e', 'p', 'h', 'y', 'r', 'M', 'T' , 'P', '\0'},
     .device_version_len = 4,              // "1.0" is 3 characters
@@ -350,6 +362,8 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
     net_buf_add_mem(buf, &device_info, sizeof(struct mtp_device_info));
     set_confirmation_needed(true);
 }
+
+
 MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
 {
     struct mtp_container mtp_response = {
@@ -362,36 +376,6 @@ MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
     net_buf_add_mem(buf, &mtp_response, 12);
 }
 
-MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_PROPS_SUPPORTED)
-{
-    struct mtp_data_block data_block;
-    data_block.container_type = MTP_CONTAINER_DATA;
-    data_block.response_code = mtp_command->code;
-    data_block.transaction_id = mtp_command->transaction_id;
-
-    uint32_t props_count = 11;
-    uint16_t props[] = {
-        MTP_PROPERTY_STORAGE_ID,
-        MTP_PROPERTY_OBJECT_FORMAT,
-        MTP_PROPERTY_PROTECTION_STATUS,
-        MTP_PROPERTY_OBJECT_SIZE,
-        MTP_PROPERTY_OBJECT_FILE_NAME,
-        MTP_PROPERTY_DATE_MODIFIED,
-        MTP_PROPERTY_PARENT_OBJECT,
-        MTP_PROPERTY_PERSISTENT_UID,
-        MTP_PROPERTY_NAME,
-        MTP_PROPERTY_DISPLAY_NAME,
-        MTP_PROPERTY_FAX_NUMBER_BUSINESS
-    };
-
-    data_block.container_length = (sizeof(struct mtp_data_block) + sizeof (uint32_t) + sizeof(props));
-
-    net_buf_add_mem(buf, &data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf, &props_count, sizeof(uint32_t));
-    net_buf_add_mem(buf, &props, sizeof(props));
-
-    set_confirmation_needed(true);
-}
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 {
@@ -440,9 +424,10 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
     data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct storage_info_t));
     net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
     net_buf_add_mem(buf,storage_info, sizeof(struct storage_info_t));
-    set_confirmation_needed(true);
 
+    set_confirmation_needed(true);
 }
+
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
 {
@@ -499,39 +484,6 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
     set_confirmation_needed(true);
 }
 
-#define OBJECT_PROTECTION_NO	                0x0000
-#define OBJECT_PROTECTION_READ_ONLY	            0x0001
-#define OBJECT_PROTECTION_READ_ONLY_DATA	    0x8002
-#define OBJECT_PROTECTION_NON_TRANSFERRABLE     0x8003
-struct mtp_object_info {
-    uint32_t StorageID;                 // Example: 0x00010001 (Storage ID 1)
-    uint16_t ObjectFormat;              // Example: 0x3001 (Association/Folders)
-    uint16_t ProtectionStatus;          // Example: 0x0000 (No protection)
-    uint32_t ObjectCompressedSize;                // Example: 0x0000000000010000 (64KB)
-    uint16_t ThumbFormat;               // Example: 0x3801 (JPEG Thumbnail)
-    uint32_t ThumbCompressedSize;       // Example: 0x00002000 (8KB)
-    uint32_t ThumbPixWidth;             // Example: 128 pixels
-    uint32_t ThumbPixHeight;            // Example: 128 pixels
-    uint32_t ImagePixWidth;             // Example: 1920 pixels (Full Image Width)
-    uint32_t ImagePixHeight;            // Example: 1080 pixels (Full Image Height)
-    uint32_t ImageBitDepth;             // Example: 24-bit color depth
-    uint32_t ParentObject;              // Example: 0x00000000 (No parent)
-    uint16_t AssociationType;           // Example: 0x0001 (Folder)
-    uint32_t AssociationDesc;           // Example: 0x00000000 (No association desc)
-    uint32_t SequenceNumber;            // Example: 0x00000001 (First object)
-
-    uint8_t FileNameLength;
-    uint16_t FileName[9];               // Example: "SampleFile.jpg"
-
-    uint8_t DateCreatedLength;
-    uint16_t DateCreated[16];               // Example: 0x000000007FF00000 (Timestamp)
-
-    uint8_t DateModifiedLength;
-    uint16_t DateModified[16];              // Example: 0x000000007FF01000 (Timestamp)
-
-    uint8_t KeywordsLength;
-    uint16_t Keywords[0];               // Example: "Sample, Image"
-} __packed;
 
 MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
 {
@@ -579,7 +531,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
             .StorageID      = 0x00010001,
             .ObjectFormat   = MTP_FORMAT_TEXT,
             .ProtectionStatus = OBJECT_PROTECTION_NO,
-            .ObjectCompressedSize = 1024,
+            .ObjectCompressedSize = 11,
             .ThumbFormat  = 0,
             .ThumbCompressedSize = 0,
             .ThumbPixWidth = 0,
@@ -609,165 +561,71 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
     set_confirmation_needed(true);
 }
 
-#define MTP_DATA_TYPE_UINT16 0x0004
-#define MTP_DATA_TYPE_UINT32 0x0006
-#define MTP_DATA_TYPE_UINT64 0x0008
-struct mtp_object_property_u64 {
-    uint16_t code;
-    uint16_t datatype;
-    uint8_t get_set;
-    uint64_t default_value;
-    uint32_t group_code;
-    uint8_t formflag;
-} __packed;
-
-struct mtp_object_property_u32 {
-    uint16_t code;
-    uint16_t datatype;
-    uint8_t get_set;
-    uint32_t default_value;
-    uint32_t group_code;
-    uint8_t formflag;
-} __packed;
-
-struct mtp_object_property_u16 {
-    uint16_t code;
-    uint16_t datatype;
-    uint8_t get_set;
-    uint32_t default_value;
-    uint32_t group_code;
-    uint8_t formflag;
-} __packed;
+#define MTP_DATA_TYPE_UINT8  0x0002
 
 struct mtp_object_property_u8 {
     uint16_t code;
-    uint8_t datatype;
+    uint16_t datatype;
     uint8_t get_set;
-    uint32_t default_value;
+    uint8_t default_value;
     uint32_t group_code;
     uint8_t formflag;
 } __packed;
 
-MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_PROP_DESC)
+
+MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_PROP_DESC)
 {
+    LOG_DBG("\n\t\tParam0: 0x%x"
+            "\n\t\tParam1: 0x%x"
+            "\n\t\tParam2: 0x%x",
+            mtp_command->param[0], mtp_command->param[1], mtp_command->param[2]);
+
     struct mtp_data_block data_block;
 
     data_block.container_type = MTP_CONTAINER_DATA;
     data_block.response_code =  mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-    uint32_t obj_prop_code = mtp_command->param[0];
-    uint32_t obj_format_code = mtp_command->param[1];
-
-    LOG_DBG("\n\t\tObjPropCode  : 0x%x" MAGENTA " [%s] " RESET
-            "\n\t\tObjFormatCode: 0x%x" MAGENTA " [%s] " RESET "\n",
-            obj_prop_code, mtp_code_to_string(obj_prop_code),
-            obj_format_code, mtp_code_to_string(obj_format_code));
-
-    if (obj_prop_code == MTP_PROPERTY_PROTECTION_STATUS)
+    /* although packet is correct but windows doesn't show the right battery level */
+    if (mtp_command->param[0] == MTP_DEVICE_PROPERTY_BATTERY_LEVEL)
     {
-        struct mtp_object_property_u16 prop = {
-            .code = obj_prop_code,
-            .datatype = MTP_DATA_TYPE_UINT16,
-            .get_set = 0x0, //Get
-            .default_value = 0, //Unused
+        struct mtp_object_property_u8 prop = {
+            .code = MTP_DEVICE_PROPERTY_BATTERY_LEVEL,
+            .datatype = MTP_DATA_TYPE_UINT8,
+            .get_set = 0,
+            .default_value = 0,
             .group_code = 0,
-            .formflag = 0x2
+            .formflag = 0x00
         };
 
-        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_object_property_u16));
-        net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-        net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u16));
-    } else if (obj_prop_code == MTP_PROPERTY_STORAGE_ID) {
-        struct mtp_object_property_u32 prop = {
-            .code = obj_prop_code,
-            .datatype = MTP_DATA_TYPE_UINT32,
-            .get_set = 0x0, //Get
-            .default_value = 0x00010001, //Unused
-            .group_code = 0,
-            .formflag = 0x0
-        };
+        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof (struct mtp_object_property_u8));
 
-        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_object_property_u32));
         net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-        net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u32));
-    } else if (obj_prop_code == MTP_PROPERTY_OBJECT_SIZE) {
-        struct mtp_object_property_u64 prop = {
-            .code = obj_prop_code,
-            .datatype = MTP_DATA_TYPE_UINT64,
-            .get_set = 0x0, //Get
-            .default_value = 1024, //Unused
-            .group_code = 0,
-            .formflag = 0x0
-        };
-
-        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_object_property_u32));
-        net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-        net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u32));
-    } else if (obj_prop_code == MTP_PROPERTY_DISPLAY_NAME) {
-        struct mtp_object_property_u64 prop = {
-            .code = obj_prop_code,
-            .datatype = MTP_DATA_TYPE_UINT64,
-            .get_set = 0x0, //Get
-            .default_value = 1024, //Unused
-            .group_code = 0,
-            .formflag = 0x0
-        };
-
-        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_object_property_u32));
-        net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-        net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u32));
-    } else {
-        LOG_WRN("Unknown Obj Prop Code 0x%x", obj_prop_code);
-        return;
+        net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u8));
     }
 
     set_confirmation_needed(true);
 }
 
-MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_PROP_VALUE)
+MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
 {
+    LOG_DBG("\n\t\tParam0: 0x%x"
+            "\n\t\tParam1: 0x%x"
+            "\n\t\tParam2: 0x%x",
+            mtp_command->param[0], mtp_command->param[1], mtp_command->param[2]);
+
     struct mtp_data_block data_block;
 
     data_block.container_type = MTP_CONTAINER_DATA;
     data_block.response_code =  mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-    uint32_t obj_handle = mtp_command->param[0];
-    uint32_t obj_prop_code = mtp_command->param[1];
-
-    uint16_t prop_type = 0x0;
-    LOG_DBG("\n\t\tObjHandle  : 0x%x"
-            "\n\t\tObjPropCode: 0x%x " MAGENTA "[%s]" RESET "\n",
-             obj_handle, obj_prop_code, mtp_code_to_string(obj_prop_code));
-
-    switch (obj_prop_code)
-    {
-        case MTP_PROPERTY_OBJECT_FORMAT:
-            if (obj_handle == 0x1) {
-                    prop_type = MTP_FORMAT_ASSOCIATION;
-            } else if (obj_handle == 0x2) {
-                    prop_type = MTP_FORMAT_TEXT;
-            } else if (obj_handle == 0x3) {
-
-            }
-        break;
-        case MTP_PROPERTY_PROTECTION_STATUS:
-            prop_type = 0x0;
-            break;
-        case MTP_PROPERTY_STORAGE_ID:
-            prop_type = 0x100001;
-            break;
-        default:
-            LOG_WRN("Property not implemented (0x%x)", obj_prop_code);
-            break;
-
-    }
-    data_block.container_length = (sizeof(struct mtp_data_block) + sizeof (uint16_t));
+    //HelloWorld!
+    char* s = "HelloWorld!";
+    data_block.container_length = (sizeof(struct mtp_data_block) + strlen(s));
 
     net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf,&prop_type,sizeof(uint16_t));
-
+    net_buf_add_mem(buf,s, strlen(s));
     set_confirmation_needed(true);
 }
 
@@ -815,7 +673,7 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         MTP_CMD(MTP_OP_GET_OBJECT_INFO);
     break;
     case MTP_OP_GET_OBJECT:
-        LOG_ERR("MTP_OP_GET_OBJECT not implemented!");
+        MTP_CMD(MTP_OP_GET_OBJECT);
     break;
     case MTP_OP_GET_THUMB:
         LOG_ERR("MTP_OP_GET_THUMB Not Implemented!");
@@ -833,7 +691,7 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         LOG_ERR("MTP_OP_RESET_DEVICE Not Implemented!");
         break;
     case MTP_OP_GET_DEVICE_PROP_DESC:
-        LOG_ERR("MTP_OP_GET_DEVICE_PROP_DESC Not Implemented!");
+        MTP_CMD(MTP_OP_GET_DEVICE_PROP_DESC);
         break;
     case MTP_OP_GET_DEVICE_PROP_VALUE:
         LOG_ERR("MTP_OP_GET_DEVICE_PROP_VALUE Not Implemented!");
@@ -854,13 +712,13 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         LOG_ERR("MTP_OP_GET_PARTIAL_OBJECT Not Implemented!");
         break;
     case MTP_OP_GET_OBJECT_PROPS_SUPPORTED:
-        MTP_CMD(MTP_OP_GET_OBJECT_PROPS_SUPPORTED);
+        LOG_ERR("MTP_OP_GET_OBJECT_PROPS_SUPPORTED Not Implemented!");
         break;
     case MTP_OP_GET_OBJECT_PROP_DESC:
-        MTP_CMD(MTP_OP_GET_OBJECT_PROP_DESC);
+        LOG_ERR("MTP_OP_GET_OBJECT_PROP_DESC Not Implemented!");
         break;
     case MTP_OP_GET_OBJECT_PROP_VALUE:
-        MTP_CMD(MTP_OP_GET_OBJECT_PROP_VALUE);
+        LOG_ERR("MTP_OP_GET_OBJECT_PROP_VALUE Not Implemented!");
         break;
     case MTP_OP_SET_OBJECT_PROP_VALUE:
         LOG_ERR("MTP_OP_SET_OBJECT_PROP_VALUE Not Implemented!");
@@ -878,6 +736,7 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
 
     return 0;
 }
+
 
 int mtp_send_confirmation(struct net_buf *buf)
 {
