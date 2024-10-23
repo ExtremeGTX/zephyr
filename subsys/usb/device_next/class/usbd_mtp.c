@@ -8,7 +8,7 @@
 #include <zephyr/drivers/usb/udc.h>
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(usb_mtp, 2); //CONFIG_USBD_MTP_LOG_LEVEL
+LOG_MODULE_REGISTER(usb_mtp, 3); //CONFIG_USBD_MTP_LOG_LEVEL
 
 /* Endpoint addresses */
 #define MTP_IN_EP_ADDR                  0x81  /* Bulk IN */
@@ -19,6 +19,14 @@ LOG_MODULE_REGISTER(usb_mtp, 2); //CONFIG_USBD_MTP_LOG_LEVEL
 #define MTP_REQUEST_CANCEL              0x64U
 #define MTP_REQUEST_GET_DEVICE_STATUS   0x67U
 #define MTP_REQUEST_DEVICE_RESET        0x66U
+
+#define MTP_RESPONSE_OK             0x2001
+#define MTP_RESPONSE_DEVICE_BUSY    0x2019
+
+
+#define BOLDMAGENTA "\033[1m\033[35m"      /* Bold Magenta */
+#define BOLDWHITE   "\033[1m\033[35m"      /* Bold White */
+#define RESET       "\033[0m"
 
 #define BUF_TRACE_DEBUG 0
 
@@ -58,6 +66,11 @@ struct mtp_data {
 	const struct usb_desc_header **const fs_desc;
 	const struct usb_desc_header **const hs_desc;
 	atomic_t state;
+};
+
+struct mtp_device_status {
+	uint16_t	wLength;
+	uint16_t	wCode;
 };
 
 
@@ -112,10 +125,31 @@ static int mtp_control_to_host(struct usbd_class_data *c_data,
 			      const struct usb_setup_packet *const setup,
 			      struct net_buf *const buf)
 {
-	LOG_ERR("%s: Class request 0x%x (Recipient: %x) is not Implemented",
+	LOG_DBG("%s: Class request 0x%x (Recipient: %x) is not Implemented",
                         __func__,
                         setup->bRequest,
                         setup->RequestType.recipient);
+
+    switch(setup->bRequest)
+    {
+        case MTP_REQUEST_GET_DEVICE_STATUS:
+            struct mtp_device_status status = {
+                .wCode = MTP_RESPONSE_OK,
+                .wLength = sizeof(struct mtp_device_status)
+            };
+		    net_buf_add_mem(buf, &status, sizeof(struct mtp_device_status));
+        break;
+
+        case MTP_REQUEST_CANCEL:
+            LOG_ERR("MTP_REQUEST_CANCEL is not implemented");
+        break;
+
+        case MTP_REQUEST_DEVICE_RESET:
+            LOG_ERR("MTP_REQUEST_DEVICE_RESET is not implemented");
+        break;
+
+
+    }
 	return 0;
 }
 
@@ -133,20 +167,25 @@ static int mtp_control_to_dev(struct usbd_class_data *c_data,
 
 static void mtp_enable(struct usbd_class_data *const c_data);
 
+#define USE_PENDING_FN  1
+
 static int mtp_request_handler(struct usbd_class_data *c_data,
 			      struct net_buf *buf, int err)
 {
+        LOG_INF("\n\n");
+        LOG_INF(BOLDWHITE"==[mtp_request_handler]=============Entry============"RESET);
+
         struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
         struct udc_buf_info *bi =  (struct udc_buf_info *)net_buf_user_data(buf);
         int ret = 0;
 
         struct net_buf* buf_resp = NULL;
 
-        if (bi->ep == MTP_OUT_EP_ADDR){
-            LOG_INF("=================START=================");
+        if (bi->ep == MTP_OUT_EP_ADDR) {
+            LOG_INF(BOLDWHITE"==[START] -> [Host Sent a command]========================="RESET);
             LOG_INF("%s: %p -> ep 0x%02x, buf: %p len %u, err %d",__func__, c_data, bi->ep, buf, buf->len, err);
             LOG_HEXDUMP_INF(buf->data, buf->len, "mtp_request_handler");
-            buf_resp = mtp_buf_alloc(0x81);
+            buf_resp = mtp_buf_alloc(MTP_IN_EP_ADDR);
             if (buf_resp == NULL){
                 LOG_ERR("%s: Buffer allocation failed!", __func__);
                 LOG_ERR("REF COUNT %u", buf_resp->ref);
@@ -166,30 +205,64 @@ static int mtp_request_handler(struct usbd_class_data *c_data,
                 LOG_DBG("[replied to Host ... DONE]");
             }
         } else if (bi->ep == MTP_IN_EP_ADDR) {
-            LOG_DBG("Host event EP: %x (buf %p, len: %u)", bi->ep, buf, buf->len);
+            LOG_WRN("Host event EP: %x[%s] (buf %p, len: %u)",
+                                bi->ep,
+                                bi->ep == 0x01 ? "MTP_OUT_EP_ADDR" : "MTP_IN_EP_ADDR",
+                                buf,
+                                buf->len);
+#if USE_PENDING_FN
+            if (mtp_packet_pending()) {
+#else
             if (mtp_confirmation_needed()) {
-                LOG_INF("Confirm to HOST");
-                buf_resp = mtp_buf_alloc(0x81);
+#endif
+                LOG_INF("Sending Pending packet");
+                buf_resp = mtp_buf_alloc(MTP_IN_EP_ADDR);
                 if (buf_resp == NULL){
                     LOG_ERR("%s: Buffer allocation failed 4!", __func__);
                     LOG_ERR("REF COUNT %u", buf_resp->ref);
                     return -1;
                 }
-
+#if USE_PENDING_FN
+                send_pending_packet(buf_resp);
+#else
                 mtp_send_confirmation(buf_resp);
+#endif
                 ret = usbd_ep_enqueue(c_data, buf_resp);
                 if (ret) {
                     LOG_ERR("Failed to enqueue net_buf %d", ret);
                     net_buf_unref(buf_resp);
                 }
-                LOG_DBG("CONFIRMATION DONE");
+                LOG_DBG("Pending DONE");
+#if 0
+                int loops = 0;
+                while (mtp_packet_pending())
+                {
+                    LOG_WRN("[Loop] ONE MORE PACKET PENDING %u", loops);
+                    mtp_enable(c_data);
+                    buf_resp = mtp_buf_alloc(MTP_IN_EP_ADDR);
+                    send_pending_packet(buf_resp);
+
+                    ret = usbd_ep_enqueue(c_data, buf_resp);
+                    if (ret) {
+                        LOG_ERR("[Loop] Failed to enqueue net_buf %d", ret);
+                        net_buf_unref(buf_resp);
+                    }
+                }
+#endif
             } else {
+                LOG_WRN("No Pending packet");
                 mtp_enable(c_data);
             }
-            LOG_INF("================= END =================");
+            LOG_INF(BOLDWHITE"==[END] -> [Host Confirmed a reply]======================"RESET);
         } else {
             LOG_ERR("SHOULDN'T BE HERE!");
         }
+
+        LOG_INF(BOLDWHITE"==[mtp_request_handler]==== Destroy buf %p EP: 0x%x [%s] ====="RESET,
+                                buf,
+                                udc_get_buf_info(buf)->ep,
+                                udc_get_buf_info(buf)->ep == 0x01 ? "MTP_OUT_EP_ADDR" : "MTP_IN_EP_ADDR" );
+
         return usbd_ep_buf_free(uds_ctx, buf);
 }
 
@@ -198,7 +271,7 @@ static void mtp_enable(struct usbd_class_data *const c_data)
 {
 	struct mtp_data *data = usbd_class_get_private(c_data);
 
-    struct net_buf *bufp = mtp_buf_alloc(0x01);
+    struct net_buf *bufp = mtp_buf_alloc(MTP_OUT_EP_ADDR);
     if (bufp == NULL){
         LOG_ERR("%s: Buffer allocation failed! 5", __func__);
         return;

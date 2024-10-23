@@ -338,8 +338,43 @@ const char* mtp_code_to_string(uint16_t code)
     return str;
 }
 
-static int confirm_msg_compeletion = 0;
 
+static int mtp_send_confirmation(struct net_buf *buf);
+
+#define USE_PENDING_FN  1
+
+#if USE_PENDING_FN
+typedef int (pending_fn_t)(struct net_buf *buf);
+static pending_fn_t* pending_fn = NULL;
+
+static void clear_pending_packet()
+{
+    pending_fn = NULL;
+}
+
+static void set_pending_packet(pending_fn_t* pend_fn)
+{
+    pending_fn = pend_fn;
+}
+
+int send_pending_packet(struct net_buf *buf)
+{
+    if (pending_fn) {
+        //pending_fn_t* lpfn = pending_fn;
+        //clear_pending_packet();
+        return pending_fn(buf);
+    } else {
+        return -EINVAL;
+    }
+}
+
+bool mtp_packet_pending()
+{
+    //LOG_DBG("Pending check");
+    return (pending_fn != NULL);
+}
+#else
+static int confirm_msg_compeletion = 0;
 static void set_confirmation_needed(bool set)
 {
     confirm_msg_compeletion = set ? 1 : 0;
@@ -349,6 +384,7 @@ bool mtp_confirmation_needed()
 {
     return confirm_msg_compeletion;
 }
+#endif
 
 MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 {
@@ -360,7 +396,12 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 
     net_buf_add_mem(buf, &data_block, sizeof(struct mtp_data_block));
     net_buf_add_mem(buf, &device_info, sizeof(struct mtp_device_info));
+
+#if USE_PENDING_FN
+    set_pending_packet(mtp_send_confirmation);
+#else
     set_confirmation_needed(true);
+#endif
 }
 
 
@@ -425,7 +466,12 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
     net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
     net_buf_add_mem(buf,storage_info, sizeof(struct storage_info_t));
 
+#if USE_PENDING_FN
+    set_pending_packet(mtp_send_confirmation);
+#else
     set_confirmation_needed(true);
+#endif
+
 }
 
 
@@ -449,7 +495,12 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
     net_buf_add_mem(buf,&storage_ids_count, sizeof(uint32_t));
     net_buf_add_mem(buf,&storage_ids, sizeof(storage_ids));
 
+#if USE_PENDING_FN
+    set_pending_packet(mtp_send_confirmation);
+#else
     set_confirmation_needed(true);
+#endif
+
 }
 
 MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
@@ -481,7 +532,12 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
         LOG_ERR("Buf len: %u, container_len: %u", buf->len, data_block.container_length);
     }
 
+#if USE_PENDING_FN
+    set_pending_packet(mtp_send_confirmation);
+#else
     set_confirmation_needed(true);
+#endif
+
 }
 
 
@@ -531,7 +587,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
             .StorageID      = 0x00010001,
             .ObjectFormat   = MTP_FORMAT_TEXT,
             .ProtectionStatus = OBJECT_PROTECTION_NO,
-            .ObjectCompressedSize = 11,
+            .ObjectCompressedSize = KB(2),
             .ThumbFormat  = 0,
             .ThumbCompressedSize = 0,
             .ThumbPixWidth = 0,
@@ -558,7 +614,12 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
     } else {
         LOG_ERR("Unknown file handle 0x%x", obj_handle);
     }
+
+#if USE_PENDING_FN
+    set_pending_packet(mtp_send_confirmation);
+#else
     set_confirmation_needed(true);
+#endif
 }
 
 #define MTP_DATA_TYPE_UINT8  0x0002
@@ -604,8 +665,52 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_PROP_DESC)
         net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u8));
     }
 
+#if USE_PENDING_FN
+    set_pending_packet(mtp_send_confirmation);
+#else
     set_confirmation_needed(true);
+#endif
+
 }
+
+struct getfilestate_t{
+    uint32_t total_size;
+    uint32_t sent;
+};
+
+
+#define TEST_FILE_SIZE 2048
+#define MAX_PACKET_SIZE 512
+
+struct getfilestate_t filestate;
+uint8_t filebuf[512];
+
+static int continue_get_object(struct net_buf *buf)
+{
+    int len = 0;
+    int total_chunks = (filestate.total_size / MAX_PACKET_SIZE);
+    static int chunks_sent = 0;
+    memset(filebuf,(filebuf[0]+1), 512);
+    if (filestate.sent < filestate.total_size) {
+        len = MIN(MAX_PACKET_SIZE, (filestate.total_size - filestate.sent));
+
+        net_buf_add_mem(buf, filebuf, len);
+        filestate.sent += len;
+        chunks_sent++;
+        LOG_DBG("sent [%u of %u]: %u, remaining %u",chunks_sent,total_chunks, filestate.sent, (filestate.total_size-filestate.sent));
+        if (filestate.sent >= filestate.total_size){
+            filestate.total_size = 0;
+            filestate.sent = 0;
+            LOG_DBG("Done, CONFIRMING");
+            set_pending_packet(mtp_send_confirmation);
+        } else {
+            LOG_DBG("Continue Next");
+            set_pending_packet(continue_get_object);
+        }
+    }
+    return 0;
+}
+
 
 MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
 {
@@ -620,13 +725,25 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     data_block.response_code =  mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
+    memset(filebuf, 'A', MAX_PACKET_SIZE);
     //HelloWorld!
     char* s = "HelloWorld!";
-    data_block.container_length = (sizeof(struct mtp_data_block) + strlen(s));
+    data_block.container_length = (sizeof(struct mtp_data_block) + TEST_FILE_SIZE);
 
+    filestate.total_size = TEST_FILE_SIZE;
+    filestate.sent = 11;
     net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
     net_buf_add_mem(buf,s, strlen(s));
+
+    net_buf_add_mem(buf, filebuf, (MAX_PACKET_SIZE-sizeof(struct mtp_data_block)-strlen(s)));
+    filestate.sent = strlen(s)+(MAX_PACKET_SIZE-sizeof(struct mtp_data_block)-strlen(s));
+    LOG_DBG("File Content Sent %u", filestate.sent);
+
+#if USE_PENDING_FN
+    set_pending_packet(continue_get_object);
+#else
     set_confirmation_needed(true);
+#endif
 }
 
 int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
@@ -738,7 +855,7 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
 }
 
 
-int mtp_send_confirmation(struct net_buf *buf)
+static int mtp_send_confirmation(struct net_buf *buf)
 {
     if (buf == NULL){
         LOG_ERR("%s: Null Buffer!", __func__);
@@ -746,7 +863,6 @@ int mtp_send_confirmation(struct net_buf *buf)
     }
 
     struct mtp_container* mtp_command = (struct mtp_container*)buf->data;
-    confirm_msg_compeletion = 0;
     struct mtp_container mtp_response = {
         .length = 12,
         .type = MTP_CONTAINER_RESPONSE,
@@ -754,7 +870,12 @@ int mtp_send_confirmation(struct net_buf *buf)
         .transaction_id = mtp_command->transaction_id
     };
     net_buf_add_mem(buf, &mtp_response, 12);
+
+#if USE_PENDING_FN
+    clear_pending_packet();
+#else
     set_confirmation_needed(false);
+#endif
 
     return 0;
 }
