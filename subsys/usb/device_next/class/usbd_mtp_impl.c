@@ -12,9 +12,9 @@
 LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 
 /* MTP Class-Specific Request Codes */
-#define MTP_REQUEST_CANCEL              0x64U
-#define MTP_REQUEST_GET_DEVICE_STATUS   0x67U
-#define MTP_REQUEST_DEVICE_RESET        0x66U
+#define MTP_REQUEST_CANCEL                  0x64U
+#define MTP_REQUEST_GET_DEVICE_STATUS       0x67U
+#define MTP_REQUEST_DEVICE_RESET            0x66U
 
 /* MTP Operation Codes */
 #define MTP_OP_GET_DEVICE_INFO              0x1001
@@ -86,11 +86,18 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 #define STORAGE_TYPE_FIXED_RAM              0x0003
 #define STORAGE_TYPE_REMOVABLE_RAM          0x0004
 
+/* MTP File system types */
+#define FS_TYPE_GENERIC_HIERARCHICAL        0x0002
+
 /* Object Protection */
-#define OBJECT_PROTECTION_NO	                0x0000
-#define OBJECT_PROTECTION_READ_ONLY	            0x0001
-#define OBJECT_PROTECTION_READ_ONLY_DATA	    0x8002
-#define OBJECT_PROTECTION_NON_TRANSFERRABLE     0x8003
+#define OBJECT_PROTECTION_NO	            0x0000
+#define OBJECT_PROTECTION_READ_ONLY	        0x0001
+#define OBJECT_PROTECTION_READ_ONLY_DATA	0x8002
+#define OBJECT_PROTECTION_NON_TRANSFERRABLE 0x8003
+
+#define MTP_GB(x) (x * 1ULL * 1024 * 1024 * 1024)
+
+#define MTP_STR_LEN(str)    (strlen(str)+1)
 
 #define MTP_CMD(opcode) do {                    \
             mtp_##opcode(bufp, mtp_command);    \
@@ -100,6 +107,7 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 static void mtp_##opcode(struct net_buf *buf,       \
                         struct mtp_container* mtp_command)
 
+/* Types */
 enum mtp_container_type {
     MTP_CONTAINER_UNDEFINED = 0x00,
     MTP_CONTAINER_COMMAND,
@@ -109,11 +117,11 @@ enum mtp_container_type {
 };
 
 struct mtp_container {
-    uint32_t length;  // Total length of the command block
-    uint16_t type;    // Should be 0x0001 for Command Block
-    uint16_t code;    // MTP operation code (e.g., MTP_OP_OPEN_SESSION)
+    uint32_t length;            // Total length of the command block
+    uint16_t type;              // Should be 0x0001 for Command Block
+    uint16_t code;              // MTP operation code (e.g., MTP_OP_OPEN_SESSION)
     uint32_t transaction_id;    // Transaction ID to track the command
-    uint32_t param[5];            // Optional Parameter 1 (e.g., session ID)
+    uint32_t param[5];          // Optional Parameter 1 (e.g., session ID)
 } __packed;
 
 struct mtp_data_block {
@@ -123,131 +131,47 @@ struct mtp_data_block {
     uint32_t transaction_id;    // Transaction ID of the command being responded to
 } __packed;
 
-struct mtp_device_info {
-    uint16_t standard_version;
-    uint32_t vendor_extension_id;
-    uint16_t vendor_extension_version;
-    uint8_t  vendor_extension_desc_len;
-    uint16_t vendor_extension_desc[38];  // Vendor extension description in UTF-16LE
-    uint16_t functional_mode;
-    uint32_t operations_supported_count;
-    uint16_t operations_supported[18];
-    uint32_t events_count;
-    uint16_t events_supported[6];
-    uint32_t device_properties_count;
-    uint16_t device_properties_supported[1];
-    uint32_t formats_count;
-    uint32_t image_formats_count;
-    uint16_t image_formats[2];
-    uint8_t manufacturer_len;
-    uint16_t manufacturer[7];
-    uint8_t model_len;
-    uint16_t model[10];
-    uint8_t device_version_len;
-    uint16_t device_version[4];
-    uint8_t serial_number_len;
-    uint16_t serial_number[17];
-} __packed;
-
-struct storage_info_t{
-    uint16_t type;
-    uint16_t fs_type;
-    uint16_t access_caps;
-    uint64_t max_capacity;
-    uint64_t free_space;
-    uint32_t free_space_obj;
-    uint8_t storage_desc_len;
-    uint16_t storage_desc[17];
-    uint8_t  volume_id_len;
-    uint16_t volume_id_desc[9];
-} __packed;
-
-struct mtp_object_info {
-    uint32_t StorageID;                 // Example: 0x00010001 (Storage ID 1)
-    uint16_t ObjectFormat;              // Example: 0x3001 (Association/Folders)
-    uint16_t ProtectionStatus;          // Example: 0x0000 (No protection)
-    uint32_t ObjectCompressedSize;      // Example: 0x0000000000010000 (64KB)
-    uint16_t ThumbFormat;               // Example: 0x3801 (JPEG Thumbnail)
-    uint32_t ThumbCompressedSize;       // Example: 0x00002000 (8KB)
-    uint32_t ThumbPixWidth;             // Example: 128 pixels
-    uint32_t ThumbPixHeight;            // Example: 128 pixels
-    uint32_t ImagePixWidth;             // Example: 1920 pixels (Full Image Width)
-    uint32_t ImagePixHeight;            // Example: 1080 pixels (Full Image Height)
-    uint32_t ImageBitDepth;             // Example: 24-bit color depth
-    uint32_t ParentObject;              // Example: 0x00000000 (No parent)
-    uint16_t AssociationType;           // Example: 0x0001 (Folder)
-    uint32_t AssociationDesc;           // Example: 0x00000000 (No association desc)
-    uint32_t SequenceNumber;            // Example: 0x00000001 (First object)
-
-    uint8_t FileNameLength;
-    uint16_t FileName[9];               // Example: "SampleFile.jpg"
-
-    uint8_t DateCreatedLength;
-    uint16_t DateCreated[16];               // Example: 0x000000007FF00000 (Timestamp)
-
-    uint8_t DateModifiedLength;
-    uint16_t DateModified[16];              // Example: 0x000000007FF01000 (Timestamp)
-
-    uint8_t KeywordsLength;
-    uint16_t Keywords[0];               // Example: "Sample, Image"
-} __packed;
-
-static struct mtp_device_info device_info = {
-    .standard_version = 100,            // MTP version 1.00
-    .vendor_extension_id = 6,  // MTP standard extension ID (Microsoft)
-    .vendor_extension_version = 100,    // Vendor extension version
-    .vendor_extension_desc_len = 38,    // Length in bytes, not characters
-    .vendor_extension_desc = { 'm', 'i', 'c', 'r', 'o', 's', 'o', 'f', 't', '.', 'c', 'o', 'm', ':', ' ', '1', '.', '0', ';',' ','a','n','d','r','o','i','d','.','c','o','m',':',' ','1','.','0',';', '\0' },  // "microsoft.com: 1.0;" in UTF-16LE
-    .functional_mode = 0,               // Standard mode
-    .operations_supported_count = 18,
-    .operations_supported = {
-        MTP_OP_GET_DEVICE_INFO,
-        MTP_OP_OPEN_SESSION,
-        MTP_OP_CLOSE_SESSION,
-        MTP_OP_GET_STORAGE_IDS,
-        MTP_OP_GET_STORAGE_INFO,
-        MTP_OP_GET_NUM_OBJECTS,
-        MTP_OP_GET_OBJECT_HANDLES,
-        MTP_OP_GET_OBJECT_INFO,
-        MTP_OP_GET_OBJECT,
-        MTP_OP_DELETE_OBJECT,
-        MTP_OP_SEND_OBJECT_INFO,
-        MTP_OP_SEND_OBJECT,
-        MTP_OP_RESET_DEVICE,
-        MTP_OP_MOVE_OBJECT,
-        MTP_OP_COPY_OBJECT,
-        MTP_OP_GET_PARTIAL_OBJECT,
-        MTP_OP_SET_OBJECT_REFERENCES,
-        MTP_OP_SKIP
-    },
-    .events_count = 6,
-    .events_supported = {
-        MTP_EVENT_OBJECT_ADDED,
-        MTP_EVENT_OBJECT_REMOVED,
-        MTP_EVENT_STORE_ADDED,
-        MTP_EVENT_STORE_REMOVED,
-        MTP_EVENT_DEVICE_PROP_CHANGED,
-        MTP_EVENT_OBJECT_INFO_CHANGED
-    },
-    .device_properties_count = 1,
-    .device_properties_supported = {
-        MTP_DEVICE_PROPERTY_BATTERY_LEVEL
-    },
-    .formats_count = 0,
-    .image_formats_count = 2,
-    .image_formats = {
-        MTP_FORMAT_ASSOCIATION,
-        MTP_FORMAT_TEXT
-    },
-    .manufacturer_len = 7,
-    .manufacturer = { 'Z', 'e', 'p', 'h', 'y', 'r', '\0' },
-    .model_len = 10,                       // "My Model" is 8 characters
-    .model = { 'Z', 'e', 'p', 'h', 'y', 'r', 'M', 'T' , 'P', '\0'},
-    .device_version_len = 4,              // "1.0" is 3 characters
-    .device_version = { '1', '.', '0' , '\0'},
-    .serial_number_len = 17,              // Serial number must be 32 characters in UTF-16LE
-    .serial_number = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A','B','C','D','E','F','\0'},
+/* Constants */
+static const uint16_t mtp_operations[] = {
+    MTP_OP_GET_DEVICE_INFO,
+    MTP_OP_OPEN_SESSION,
+    MTP_OP_CLOSE_SESSION,
+    MTP_OP_GET_STORAGE_IDS,
+    MTP_OP_GET_STORAGE_INFO,
+    MTP_OP_GET_NUM_OBJECTS,
+    MTP_OP_GET_OBJECT_HANDLES,
+    MTP_OP_GET_OBJECT_INFO,
+    MTP_OP_GET_OBJECT,
+    MTP_OP_DELETE_OBJECT,
+    MTP_OP_SEND_OBJECT_INFO,
+    MTP_OP_SEND_OBJECT,
+    MTP_OP_RESET_DEVICE,
+    MTP_OP_MOVE_OBJECT,
+    MTP_OP_COPY_OBJECT,
+    MTP_OP_GET_PARTIAL_OBJECT,
+    MTP_OP_SET_OBJECT_REFERENCES,
+    MTP_OP_SKIP
 };
+
+static const uint16_t events_supported[] = {
+    MTP_EVENT_OBJECT_ADDED,
+    MTP_EVENT_OBJECT_REMOVED,
+    MTP_EVENT_STORE_ADDED,
+    MTP_EVENT_STORE_REMOVED,
+    MTP_EVENT_DEVICE_PROP_CHANGED,
+    MTP_EVENT_OBJECT_INFO_CHANGED
+};
+
+static const uint16_t device_properties[] = {
+    MTP_DEVICE_PROPERTY_BATTERY_LEVEL
+};
+
+static const uint16_t playback_formats[] = {
+    MTP_FORMAT_ASSOCIATION,
+    MTP_FORMAT_TEXT
+};
+
+/********************************************************************* */
 
 #define RESET   "\033[0m"
 #define GREEN   "\033[32m"      /* Green */
@@ -338,12 +262,21 @@ const char* mtp_code_to_string(uint16_t code)
     return str;
 }
 
+/* Copy and convert ASCII-7 string descriptor to UTF16-LE */
+static void net_buf_add_utf16le(struct net_buf *buf, const char* str)
+{
+    uint16_t len = strlen(str) + 1; /* we need the null terminator */
+
+	for (int i = 0; i < len; i++) {
+		__ASSERT(ascii7_str[i] > 0x1F && ascii7_str[i] < 0x7F,
+			 "Only printable ascii-7 characters are allowed in USB "
+			 "string descriptors");
+		net_buf_add_le16(buf, str[i]);
+	}
+}
 
 static int mtp_send_confirmation(struct net_buf *buf);
 
-#define USE_PENDING_FN  1
-
-#if USE_PENDING_FN
 typedef int (pending_fn_t)(struct net_buf *buf);
 static pending_fn_t* pending_fn = NULL;
 
@@ -373,35 +306,71 @@ bool mtp_packet_pending()
     //LOG_DBG("Pending check");
     return (pending_fn != NULL);
 }
-#else
-static int confirm_msg_compeletion = 0;
-static void set_confirmation_needed(bool set)
-{
-    confirm_msg_compeletion = set ? 1 : 0;
-}
-
-bool mtp_confirmation_needed()
-{
-    return confirm_msg_compeletion;
-}
-#endif
 
 MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 {
+    /* DATA Block Header */
     struct mtp_data_block data_block;
-    data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_device_info) );
     data_block.container_type = MTP_CONTAINER_DATA;
     data_block.response_code = mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-    net_buf_add_mem(buf, &data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf, &device_info, sizeof(struct mtp_device_info));
+    //net_buf_add_mem(buf, &data_block, sizeof(struct mtp_data_block));
 
-#if USE_PENDING_FN
+    const char* vendor_extension_desc = "microsoft.com: 1.0; android.com: 1.0;";
+    const char* manufacturer = "Zephyr";
+    const char* model = "ZephyrMTP";
+    const char* device_version = "2.0";
+    const char* serial_number = "0123456789ABCDEF";
+
+    /* Device Info */
+    net_buf_add_le16(buf, 100);    /* standard_version = MTP version 1.00 */
+    net_buf_add_le32(buf, 6);      /* vendor_extension_id = MTP standard extension ID (Microsoft) */
+    net_buf_add_le16(buf, 100);    /* vendor_extension_version */
+
+    /* Vendor extension description in UTF-16LE */
+    net_buf_add_u8(buf, MTP_STR_LEN(vendor_extension_desc));   /* length */
+    net_buf_add_utf16le(buf, vendor_extension_desc);        /* string value */
+
+    /* functional_mode; */
+    net_buf_add_le16(buf, 0);
+
+    /* operations supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(mtp_operations));                  /* count */
+    net_buf_add_mem(buf, mtp_operations, sizeof(mtp_operations));       /* operations_supported[] */
+
+    /* events supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(events_supported));                /* count */
+    net_buf_add_mem(buf, events_supported, sizeof(events_supported));   /* events_supported[] */
+
+    /* Device properties supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(device_properties));               /* count */
+    net_buf_add_mem(buf, device_properties, sizeof(device_properties)); /* device_properties_supported[] */
+
+    /* Capture formats count */
+    net_buf_add_le32(buf, 0);
+
+    /* Playback formats supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(playback_formats));                /* count */
+    net_buf_add_mem(buf, playback_formats, sizeof(playback_formats));   /* playback_formats[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(manufacturer));             /* manufacturer_len */
+    net_buf_add_utf16le(buf, manufacturer);                     /* manufacturer[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(model));                    /* model_len; */
+    net_buf_add_utf16le(buf, model);                            /* model[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(device_version));           /* device_version_len; */
+    net_buf_add_utf16le(buf, device_version);                   /* device_version[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(serial_number));            /* serial_number_len; */
+    net_buf_add_utf16le(buf, serial_number);                    /* serial_number[] */
+
+    /* Add the Packet Header */
+    data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
+    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
+
     set_pending_packet(mtp_send_confirmation);
-#else
-    set_confirmation_needed(true);
-#endif
 }
 
 
@@ -420,60 +389,49 @@ MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 {
-    struct mtp_data_block data_block;
+    uint32_t requested_storage_id = mtp_command->param[0];
 
-    LOG_DBG("\n\t\tStorageID    : 0x%x\n", mtp_command->param[0]);
+    LOG_DBG("\n\t\tStorageID    : 0x%x\n", requested_storage_id);
+
+    struct mtp_data_block data_block;
     data_block.container_type = MTP_CONTAINER_DATA;
     data_block.response_code = mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-
-    struct storage_info_t* storage_info;
-    struct storage_info_t storage_info1 = {
-            .type = STORAGE_TYPE_FIXED_RAM,              // Fixed ROM (internal memory)
-            .fs_type = 0x0002,                       // Generic hierarchical file system
-            .access_caps = 0x0001,                   // Read/write access
-            .max_capacity = 16ULL * 1024 * 1024 * 1024, // 16 GB
-            .free_space = 8ULL * 1024 * 1024 * 1024,   // 8 GB free
-            .free_space_obj = 0xFFFFFFFF,                     // Free space in objects (not used)
-            .storage_desc_len = 17,                  // Length of "Internal Storage" string
-            .storage_desc = { 'I', 'n', 't', 'e', 'r', 'n', 'a', 'l', ' ', 'S', 't', 'o', 'r', 'a', 'g', 'e', '\0' }, // UTF-16LE encoded "Internal Storage"
-            .volume_id_len = 9,                      // Length of "Internal" string
-            .volume_id_desc = { 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', '\0' } // UTF-16LE encoded "Internal"
-    };
-
-    struct storage_info_t storage_info2 = {
-            .type = STORAGE_TYPE_REMOVABLE_RAM,                          // Removable RAM (external memory like SD card)
-            .fs_type = 0x0002,                       // Generic hierarchical file system
-            .access_caps = 0x0001,                   // Read/write access
-            .max_capacity = 32ULL * 1024 * 1024 * 1024, // 32 GB
-            .free_space = 10ULL * 1024 * 1024 * 1024,  // 10 GB free
-            .free_space_obj = 0xFFFFFFFF,                     // Free space in objects (not used)
-            .storage_desc_len = 17,                   // Length of "SD Card" string
-            .storage_desc = { 'S', 'D', ' ', 'C', 'a', 'r', 'd','\0','\0','\0','\0','\0','\0','\0','\0','\0','\0' },  // UTF-16LE encoded "SD Card"
-            .volume_id_len = 9,                      // Length of "SD Card" string
-            .volume_id_desc = { 'A', 'B', 'C', 'D', 'E', 'F', 'G','\0','\0' } // UTF-16LE encoded "SD Card"
-    };
-
-    storage_info = &storage_info1;
-
-    if (mtp_command->param[0] == 0x20001){
-        storage_info = &storage_info2;
+    if (requested_storage_id == 0x10001) {
+        char* storage_desc = "Internal Storage";
+        char* volumeID = "AABBCCDD";
+        net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);          /* type */
+        net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);    /* fs_type */
+        net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);     /* access_caps */
+        net_buf_add_le64(buf, MTP_GB(16));                      /* max_capacity */
+        net_buf_add_le64(buf, MTP_GB(8));                       /* free_space */
+        net_buf_add_le32(buf, 0xFFFFFFFF);                      /* free_space_obj */
+        net_buf_add_u8(buf, MTP_STR_LEN(storage_desc));         /* storage_desc_len */
+        net_buf_add_utf16le(buf, storage_desc);                 /* storage_desc[] */
+        net_buf_add_u8(buf, MTP_STR_LEN(volumeID));             /* volume_id_len */
+        net_buf_add_utf16le(buf, volumeID);                     /* volume_id_desc[] */
+    } else if (requested_storage_id == 0x20001) {
+        char* storage_desc = "SD Card";
+        char* volumeID = "ABCDEFG";
+        net_buf_add_le16(buf, STORAGE_TYPE_REMOVABLE_RAM);
+        net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);
+        net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);
+        net_buf_add_le64(buf, MTP_GB(32));
+        net_buf_add_le64(buf, MTP_GB(10));
+        net_buf_add_le32(buf, 0xFFFFFFFF);
+        net_buf_add_u8(buf, MTP_STR_LEN(storage_desc));
+        net_buf_add_utf16le(buf, storage_desc);
+        net_buf_add_u8(buf, MTP_STR_LEN(volumeID));
+        net_buf_add_utf16le(buf, volumeID);
     }
 
+    /* Add the Packet Header */
+    data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
+    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
 
-    data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct storage_info_t));
-    net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf,storage_info, sizeof(struct storage_info_t));
-
-#if USE_PENDING_FN
     set_pending_packet(mtp_send_confirmation);
-#else
-    set_confirmation_needed(true);
-#endif
-
 }
-
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
 {
@@ -495,12 +453,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
     net_buf_add_mem(buf,&storage_ids_count, sizeof(uint32_t));
     net_buf_add_mem(buf,&storage_ids, sizeof(storage_ids));
 
-#if USE_PENDING_FN
     set_pending_packet(mtp_send_confirmation);
-#else
-    set_confirmation_needed(true);
-#endif
-
 }
 
 MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
@@ -532,11 +485,8 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
         LOG_ERR("Buf len: %u, container_len: %u", buf->len, data_block.container_length);
     }
 
-#if USE_PENDING_FN
     set_pending_packet(mtp_send_confirmation);
-#else
-    set_confirmation_needed(true);
-#endif
+
 
 }
 
@@ -552,74 +502,75 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
     uint32_t obj_handle = mtp_command->param[0];
     LOG_DBG("\n\t\tObjHandle: 0x%x\n", mtp_command->param[0]);
 
-    if (obj_handle == 0x1)
-    {
-        struct mtp_object_info file0 = {
-            .StorageID      = 0x00010001,
-            .ObjectFormat   = MTP_FORMAT_ASSOCIATION,
-            .ProtectionStatus = OBJECT_PROTECTION_NO,
-            .ObjectCompressedSize = 0xFFFFFFFFUL,
-            .ThumbFormat  = 0,
-            .ThumbCompressedSize = 0,
-            .ThumbPixWidth = 0,
-            .ThumbPixHeight = 0,
-            .ImagePixWidth = 0,
-            .ImagePixHeight = 0,
-            .ImageBitDepth = 0,
-            .ParentObject = 0xFFFFFFFFUL,
-            .AssociationType = 0x0001,
-            .AssociationDesc = 0,
-            .SequenceNumber = 0,
-            .FileNameLength = 9,
-            .FileName = {'P','i','c','t','u','r','e','s','\0'},
-            .DateCreatedLength = 16,
-            .DateCreated = {'2', '0', '2', '4', '1', '0', '0', '1', 'T', '2', '2', '0', '0', '1', '5', '\0'},
-            .DateModifiedLength = 16,
-            .DateModified  = {'2', '0', '2', '4', '1', '0', '1', '1', 'T', '1', '2', '5', '8', '1', '3', '\0'},
-            .KeywordsLength = 0
-        };
+    if (obj_handle == 0x1) {
+        char* filename = "Pictures";
+        char* data_created = "20241001T220015";
+        char* data_modified = "20241011T125813";
+        net_buf_add_le32(buf, 0x00010001);                  /* StorageID */
+        net_buf_add_le16(buf, MTP_FORMAT_ASSOCIATION);      /* ObjectFormat */
+        net_buf_add_le16(buf, OBJECT_PROTECTION_NO);        /* ProtectionStatus */
+        net_buf_add_le32(buf, 0xFFFFFFFFUL);                /* ObjectCompressedSize */
+        net_buf_add_le16(buf, 0);                           /* ThumbFormat */
+        net_buf_add_le32(buf, 0);                           /* ThumbCompressedSize */
+        net_buf_add_le32(buf, 0);                           /* ThumbPixWidth */
+        net_buf_add_le32(buf, 0);                           /* ThumbPixHeight */
+        net_buf_add_le32(buf, 0);                           /* ImagePixWidth */
+        net_buf_add_le32(buf, 0);                           /* ImagePixHeight */
+        net_buf_add_le32(buf, 0);                           /* ImageBitDepth */
+        net_buf_add_le32(buf, 0xFFFFFFFFUL); /* Object in Root */                   /* ParentObject */
+        net_buf_add_le16(buf, 0x0001);                      /* AssociationType */
+        net_buf_add_le32(buf, 0);                           /* AssociationDesc */
+        net_buf_add_le32(buf, 0);                           /* SequenceNumber */
 
-        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_object_info));
-        net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-        net_buf_add_mem(buf,&file0, sizeof(struct mtp_object_info));
+        net_buf_add_u8(buf, MTP_STR_LEN(filename) ); /* FileNameLength */
+        net_buf_add_utf16le(buf, filename); /* FileName */
+
+        net_buf_add_u8(buf, MTP_STR_LEN(data_created)); /* DateCreatedLength */
+        net_buf_add_utf16le(buf, data_created); /* DateCreated */
+
+        net_buf_add_u8(buf, MTP_STR_LEN(data_modified)); /*  DateModifiedLength */
+        net_buf_add_utf16le(buf, data_modified); /* DateModified */
+
+        net_buf_add_u8(buf, 0); /*  KeywordsLength, always 0 unused */
     } else if (obj_handle == 0x2) {
-            struct mtp_object_info file1 = {
-            .StorageID      = 0x00010001,
-            .ObjectFormat   = MTP_FORMAT_TEXT,
-            .ProtectionStatus = OBJECT_PROTECTION_NO,
-            .ObjectCompressedSize = KB(2),
-            .ThumbFormat  = 0,
-            .ThumbCompressedSize = 0,
-            .ThumbPixWidth = 0,
-            .ThumbPixHeight = 0,
-            .ImagePixWidth = 0,
-            .ImagePixHeight = 0,
-            .ImageBitDepth = 0,
-            .ParentObject = 0xFFFFFFFF,
-            .AssociationType = 0x0000,
-            .AssociationDesc = 0,
-            .SequenceNumber = 0,
-            .FileNameLength = 9,
-            .FileName = {'T','e','s','t','.','t','x','t','\0'},
-            .DateCreatedLength = 16,
-            .DateCreated = {'2', '0', '2', '4', '1', '0', '0', '1', 'T', '2', '2', '0', '0', '1', '5', '\0'},
-            .DateModifiedLength = 16,
-            .DateModified  = {'2', '0', '2', '4', '1', '0', '1', '1', 'T', '1', '2', '5', '8', '1', '3', '\0'},
-            .KeywordsLength = 0
-        };
+        char* filename = "Test.txt";
+        char* data_created = "20241001T220015";
+        char* data_modified = "20241011T125813";
+        net_buf_add_le32(buf, 0x00010001);                  /* StorageID */
+        net_buf_add_le16(buf, MTP_FORMAT_TEXT);      /* ObjectFormat */
+        net_buf_add_le16(buf, OBJECT_PROTECTION_NO);        /* ProtectionStatus */
+        net_buf_add_le32(buf, KB(2));                /* ObjectCompressedSize */
+        net_buf_add_le16(buf, 0);                           /* ThumbFormat */
+        net_buf_add_le32(buf, 0);                           /* ThumbCompressedSize */
+        net_buf_add_le32(buf, 0);                           /* ThumbPixWidth */
+        net_buf_add_le32(buf, 0);                           /* ThumbPixHeight */
+        net_buf_add_le32(buf, 0);                           /* ImagePixWidth */
+        net_buf_add_le32(buf, 0);                           /* ImagePixHeight */
+        net_buf_add_le32(buf, 0);                           /* ImageBitDepth */
+        net_buf_add_le32(buf, 0xFFFFFFFFUL); /* Object in Root */                   /* ParentObject */
+        net_buf_add_le16(buf, 0x0001);                      /* AssociationType */
+        net_buf_add_le32(buf, 0);                           /* AssociationDesc */
+        net_buf_add_le32(buf, 0);                           /* SequenceNumber */
 
-        data_block.container_length = (sizeof(struct mtp_data_block) + sizeof(struct mtp_object_info));
-        net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-        net_buf_add_mem(buf,&file1, sizeof(struct mtp_object_info));
+        net_buf_add_u8(buf, MTP_STR_LEN(filename) ); /* FileNameLength */
+        net_buf_add_utf16le(buf, filename); /* FileName */
+
+        net_buf_add_u8(buf, MTP_STR_LEN(data_created)); /* DateCreatedLength */
+        net_buf_add_utf16le(buf, data_created); /* DateCreated */
+
+        net_buf_add_u8(buf, MTP_STR_LEN(data_modified)); /*  DateModifiedLength */
+        net_buf_add_utf16le(buf, data_modified); /* DateModified */
+
+        net_buf_add_u8(buf, 0); /*  KeywordsLength, always 0 unused */
     } else {
         LOG_ERR("Unknown file handle 0x%x", obj_handle);
     }
 
-#if USE_PENDING_FN
+    /* Add the Packet Header */
+    data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
+    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
+
     set_pending_packet(mtp_send_confirmation);
-#else
-    set_confirmation_needed(true);
-#endif
 }
 
 #define MTP_DATA_TYPE_UINT8  0x0002
@@ -665,12 +616,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_PROP_DESC)
         net_buf_add_mem(buf,&prop,sizeof(struct mtp_object_property_u8));
     }
 
-#if USE_PENDING_FN
     set_pending_packet(mtp_send_confirmation);
-#else
-    set_confirmation_needed(true);
-#endif
-
 }
 
 struct getfilestate_t{
@@ -739,11 +685,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     filestate.sent = strlen(s)+(MAX_PACKET_SIZE-sizeof(struct mtp_data_block)-strlen(s));
     LOG_DBG("File Content Sent %u", filestate.sent);
 
-#if USE_PENDING_FN
     set_pending_packet(continue_get_object);
-#else
-    set_confirmation_needed(true);
-#endif
 }
 
 int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
@@ -871,11 +813,7 @@ static int mtp_send_confirmation(struct net_buf *buf)
     };
     net_buf_add_mem(buf, &mtp_response, 12);
 
-#if USE_PENDING_FN
     clear_pending_packet();
-#else
-    set_confirmation_needed(false);
-#endif
 
     return 0;
 }
