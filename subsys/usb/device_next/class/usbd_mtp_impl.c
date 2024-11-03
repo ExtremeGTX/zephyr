@@ -8,6 +8,9 @@
 #include <stddef.h>
 
 #include <zephyr/net_buf.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/fs/fs.h>
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 
@@ -107,6 +110,20 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 static void mtp_##opcode(struct net_buf *buf,       \
                         struct mtp_container* mtp_command)
 
+#define FSTAB_NODE DT_PATH(fstab)
+
+#define PROCESS_FSTAB_ENTRY(node_id)					\
+	IF_ENABLED(DT_PROP(node_id, mtp_enabled),	\
+		   ({.mountpoint = DT_PROP(node_id, mount_point), .files_count = 1},))
+
+#define MAX_PATH_LEN        128
+#define MAX_FILES           20  // Define the maximum number of files to store
+
+#define PROCESS_FSTAB_ENTRY2(node_id)					\
+	IF_ENABLED(DT_PROP(node_id, mtp_enabled),	\
+		   (struct fs_object_t files##node_id[MAX_FILES];))
+
+
 /* Types */
 enum mtp_container_type {
     MTP_CONTAINER_UNDEFINED = 0x00,
@@ -169,6 +186,34 @@ static const uint16_t device_properties[] = {
 static const uint16_t playback_formats[] = {
     MTP_FORMAT_ASSOCIATION,
     MTP_FORMAT_TEXT
+};
+
+struct fs_object_t {
+    union {
+        struct {
+            uint8_t object_id;
+            uint8_t type;
+            uint8_t parent_id;
+            uint8_t storage_id;
+        };
+        uint32_t ID; // Allows access to the entire ID as a single value
+    };
+    uint32_t size;
+    char path[MAX_PATH_LEN];
+    char name[MAX_PATH_LEN];
+};
+
+
+struct storage_t {
+    const char mountpoint[10];
+    struct fs_object_t fileslist[MAX_FILES];
+    uint16_t files_count;
+};
+
+
+static struct storage_t available_storages[] = {
+    {.mountpoint = "NULL"},
+    DT_FOREACH_CHILD(FSTAB_NODE, PROCESS_FSTAB_ENTRY)
 };
 
 /********************************************************************* */
@@ -389,7 +434,7 @@ MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 {
-    uint32_t requested_storage_id = mtp_command->param[0];
+    uint32_t requested_storage_id = mtp_command->param[0] & 0x0F;
 
     LOG_DBG("\n\t\tStorageID    : 0x%x\n", requested_storage_id);
 
@@ -398,33 +443,32 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
     data_block.response_code = mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-    if (requested_storage_id == 0x10001) {
-        char* storage_desc = "Internal Storage";
-        char* volumeID = "AABBCCDD";
-        net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);          /* type */
-        net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);    /* fs_type */
-        net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);     /* access_caps */
-        net_buf_add_le64(buf, MTP_GB(16));                      /* max_capacity */
-        net_buf_add_le64(buf, MTP_GB(8));                       /* free_space */
-        net_buf_add_le32(buf, 0xFFFFFFFF);                      /* free_space_obj */
-        net_buf_add_u8(buf, MTP_STR_LEN(storage_desc));         /* storage_desc_len */
-        net_buf_add_utf16le(buf, storage_desc);                 /* storage_desc[] */
-        net_buf_add_u8(buf, MTP_STR_LEN(volumeID));             /* volume_id_len */
-        net_buf_add_utf16le(buf, volumeID);                     /* volume_id_desc[] */
-    } else if (requested_storage_id == 0x20001) {
-        char* storage_desc = "SD Card";
-        char* volumeID = "ABCDEFG";
-        net_buf_add_le16(buf, STORAGE_TYPE_REMOVABLE_RAM);
-        net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);
-        net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);
-        net_buf_add_le64(buf, MTP_GB(32));
-        net_buf_add_le64(buf, MTP_GB(10));
-        net_buf_add_le32(buf, 0xFFFFFFFF);
-        net_buf_add_u8(buf, MTP_STR_LEN(storage_desc));
-        net_buf_add_utf16le(buf, storage_desc);
-        net_buf_add_u8(buf, MTP_STR_LEN(volumeID));
-        net_buf_add_utf16le(buf, volumeID);
+    if (requested_storage_id == 0){
+        LOG_ERR("Unknown Storage ID %x", requested_storage_id);
     }
+
+    struct fs_statvfs stat;
+    int err = fs_statvfs(available_storages[requested_storage_id].mountpoint, &stat);
+    if (err < 0) {
+        LOG_ERR("Failed to statvfs %s (%d)", available_storages[requested_storage_id].mountpoint, err);
+        return;
+    }
+
+    const char* storage_name = available_storages[requested_storage_id].mountpoint;
+    if (storage_name[0] == '/') {
+        /* skip the slash */
+        storage_name++;
+    }
+
+    net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);                  /* type */
+    net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);            /* fs_type */
+    net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);             /* access_caps */
+    net_buf_add_le64(buf, (stat.f_blocks * stat.f_frsize));         /* max_capacity */
+    net_buf_add_le64(buf, (stat.f_bfree * stat.f_frsize));          /* free_space */
+    net_buf_add_le32(buf, 0xFFFFFFFF);                              /* free_space_obj */
+    net_buf_add_u8(buf, MTP_STR_LEN(storage_name));                 /* storage_desc_len */
+    net_buf_add_utf16le(buf, storage_name);                         /* storage_desc[] */
+    net_buf_add_u8(buf, 0);                                         /* volume_id_len, Unused */
 
     /* Add the Packet Header */
     data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
@@ -432,6 +476,9 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 
     set_pending_packet(mtp_send_confirmation);
 }
+
+#define GEN_INTERNAL_STORAGE_ID(id)     (0x00010000 + id)
+#define GEN_REMOVABLE_STORAGE_ID(id)    (0x00020000 + id)
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
 {
@@ -441,20 +488,83 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
     data_block.response_code =  mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-    uint32_t storage_ids_count = 2;
-    const uint32_t storage_ids[] = {
-        0x00010001,  // Storage ID for internal memory
-        0x00020001   // Storage ID for external SD card
-    };
+    net_buf_add_le32(buf, ARRAY_SIZE(available_storages)-1); /* Number of Storages */
+    for (int i=1; i < ARRAY_SIZE(available_storages); i++)
+    {
+        net_buf_add_le32(buf, GEN_INTERNAL_STORAGE_ID(i)); /* Use array index as Storage ID, 0x00 can't be used */
+    }
 
-    data_block.container_length = (sizeof(struct mtp_data_block) + sizeof (uint32_t) + sizeof(storage_ids));
-
-    net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf,&storage_ids_count, sizeof(uint32_t));
-    net_buf_add_mem(buf,&storage_ids, sizeof(storage_ids));
+    /* Add the Packet Header */
+    data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
+    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
 
     set_pending_packet(mtp_send_confirmation);
 }
+
+static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t parent)
+{
+    char path[MAX_PATH_LEN];
+    struct fs_dir_t dir;
+    int err;
+    struct storage_t* sstorage = &available_storages[storage_id];
+
+    fs_dir_t_init(&dir);
+
+    err = fs_opendir(&dir, root_path);
+    if (err) {
+        LOG_ERR("Unable to open %s (err %d)", root_path, err);
+        return -ENOEXEC;
+    }
+
+    while (1) {
+        struct fs_dirent entry;
+
+        err = fs_readdir(&dir, &entry);
+        if (err) {
+            LOG_ERR("Unable to read directory");
+            break;
+        }
+
+        // Check for end of directory listing
+        if (entry.name[0] == '\0') {
+            break;
+        }
+
+        // Build the full path of the file or directory
+        snprintf(path, sizeof(path), "%s/%s%s", root_path, entry.name, (entry.type == FS_DIR_ENTRY_DIR) ? "/" : "");
+
+        // If it's a file, store the path in the array
+        if (sstorage->files_count < MAX_FILES) {
+            strncpy(sstorage->fileslist[sstorage->files_count].path, path, MAX_PATH_LEN - 1);
+            strncpy(sstorage->fileslist[sstorage->files_count].name, entry.name, MAX_PATH_LEN - 1);
+            sstorage->fileslist[sstorage->files_count].size = entry.size;
+            sstorage->fileslist[sstorage->files_count].type = (entry.type == FS_DIR_ENTRY_DIR ? 1 : 0) ;
+            sstorage->fileslist[sstorage->files_count].parent_id = parent;
+            sstorage->fileslist[sstorage->files_count].object_id = sstorage->files_count;
+            sstorage->fileslist[sstorage->files_count].storage_id = storage_id;
+            sstorage->files_count++;
+
+            if (entry.type == FS_DIR_ENTRY_DIR) {
+                // Recursive call to traverse subdirectory
+                dir_traverse(storage_id, path, sstorage->fileslist[sstorage->files_count-1].object_id);
+            }
+
+        } else {
+            LOG_ERR("Max file count reached, cannot store more paths.");
+            break;
+        }
+
+    }
+
+    fs_closedir(&dir);
+
+    return 0;
+}
+
+#define GET_OBJECT_ID(objID)   ((uint8_t)(objID & 0xFF))
+#define GET_TYPE(objID)        ((uint8_t)((objID >> 8) & 0xFF))
+#define GET_PARENT_ID(objID)   ((uint8_t)((objID >> 16) & 0xFF))
+#define GET_STORAGE_ID(objID)  ((uint8_t)((objID >> 24) & 0xFF))
 
 MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
 {
@@ -464,30 +574,31 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
     data_block.response_code =  mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
 
-    uint32_t storage_id = mtp_command->param[0];
+    uint32_t storage_id = mtp_command->param[0] & 0x0F;
     uint32_t obj_format_code = mtp_command->param[1];
     uint32_t obj_handle = mtp_command->param[2];
-
-    uint32_t object_handles[] = { 0x00000001, 0x00000002,/*0x00000003*/ };  // Example object handles
-    uint32_t num_handles = sizeof(object_handles) / sizeof(object_handles[0]);
 
     LOG_DBG("\n\t\tStorageID    : 0x%x"
             "\n\t\tObjFormatCode: 0x%x"
             "\n\t\tObjHandle    : 0x%x \n",
                 storage_id, obj_format_code, obj_handle);
 
-    data_block.container_length = (sizeof(struct mtp_data_block) + sizeof (uint32_t) + sizeof(object_handles));
-    net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf,&num_handles,sizeof(uint32_t));
-    net_buf_add_mem(buf,object_handles, sizeof(object_handles));
-
-    if (buf->len != data_block.container_length) {
-        LOG_ERR("Buf len: %u, container_len: %u", buf->len, data_block.container_length);
+    uint32_t found_files = 0;
+    uint32_t parent_id = (obj_handle == 0xffffffff ? 0xff : GET_OBJECT_ID(obj_handle));
+    for (int i=0;i<available_storages[storage_id].files_count;++i) {
+        LOG_WRN("Comparing Req:%x %x", parent_id, available_storages[storage_id].fileslist[i].parent_id);
+        if (available_storages[storage_id].fileslist[i].parent_id == parent_id) {
+            net_buf_add_le32(buf, available_storages[storage_id].fileslist[i].ID);
+            found_files++;
+        }
     }
+    net_buf_push_mem(buf, &found_files, sizeof(uint32_t));
+
+    /* Add the Packet Header */
+    data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
+    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
 
     set_pending_packet(mtp_send_confirmation);
-
-
 }
 
 
@@ -500,16 +611,30 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
     data_block.transaction_id = mtp_command->transaction_id;
 
     uint32_t obj_handle = mtp_command->param[0];
+    uint8_t storage_id = GET_STORAGE_ID(obj_handle);
+    uint8_t object_id =  GET_OBJECT_ID(obj_handle);
     LOG_DBG("\n\t\tObjHandle: 0x%x\n", mtp_command->param[0]);
 
-    if (obj_handle == 0x1) {
-        char* filename = "Pictures";
+    if (available_storages[storage_id].fileslist[object_id].ID == obj_handle) {
+        char* filename = available_storages[storage_id].fileslist[object_id].name;
         char* data_created = "20241001T220015";
         char* data_modified = "20241011T125813";
+
         net_buf_add_le32(buf, 0x00010001);                  /* StorageID */
-        net_buf_add_le16(buf, MTP_FORMAT_ASSOCIATION);      /* ObjectFormat */
+
+        if (available_storages[storage_id].fileslist[object_id].type == 1) {
+            net_buf_add_le16(buf, MTP_FORMAT_ASSOCIATION);  /* ObjectFormat */
+        } else {
+            net_buf_add_le16(buf, MTP_FORMAT_TEXT);         /* ObjectFormat */
+        }
+
         net_buf_add_le16(buf, OBJECT_PROTECTION_NO);        /* ProtectionStatus */
-        net_buf_add_le32(buf, 0xFFFFFFFFUL);                /* ObjectCompressedSize */
+
+        if (available_storages[storage_id].fileslist[object_id].type == 1){
+            net_buf_add_le32(buf, 0xFFFFFFFFUL);            /* ObjectCompressedSize */
+        } else {
+            net_buf_add_le32(buf, available_storages[storage_id].fileslist[object_id].size);
+        }
         net_buf_add_le16(buf, 0);                           /* ThumbFormat */
         net_buf_add_le32(buf, 0);                           /* ThumbCompressedSize */
         net_buf_add_le32(buf, 0);                           /* ThumbPixWidth */
@@ -517,53 +642,32 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
         net_buf_add_le32(buf, 0);                           /* ImagePixWidth */
         net_buf_add_le32(buf, 0);                           /* ImagePixHeight */
         net_buf_add_le32(buf, 0);                           /* ImageBitDepth */
-        net_buf_add_le32(buf, 0xFFFFFFFFUL); /* Object in Root */                   /* ParentObject */
+        if (available_storages[storage_id].fileslist[object_id].parent_id == 0xffff) {
+            LOG_DBG("%s in root", available_storages[storage_id].fileslist[object_id].name);
+            net_buf_add_le32(buf, 0xFFFFFFFFUL);            /* ParentObject (0xFFFF if Object in Root) */
+        } else {
+            LOG_DBG("%s in parent %x",
+                    available_storages[storage_id].fileslist[object_id].name,
+                    available_storages[storage_id].fileslist[object_id].parent_id);
+            net_buf_add_le32(buf, available_storages[storage_id].fileslist[object_id].parent_id);                    /* ParentObject */
+        }
         net_buf_add_le16(buf, 0x0001);                      /* AssociationType */
         net_buf_add_le32(buf, 0);                           /* AssociationDesc */
         net_buf_add_le32(buf, 0);                           /* SequenceNumber */
 
-        net_buf_add_u8(buf, MTP_STR_LEN(filename) ); /* FileNameLength */
-        net_buf_add_utf16le(buf, filename); /* FileName */
+        net_buf_add_u8(buf, MTP_STR_LEN(filename) );        /* FileNameLength */
+        net_buf_add_utf16le(buf, filename);                 /* FileName */
 
-        net_buf_add_u8(buf, MTP_STR_LEN(data_created)); /* DateCreatedLength */
-        net_buf_add_utf16le(buf, data_created); /* DateCreated */
+        net_buf_add_u8(buf, MTP_STR_LEN(data_created));     /* DateCreatedLength */
+        net_buf_add_utf16le(buf, data_created);             /* DateCreated */
 
-        net_buf_add_u8(buf, MTP_STR_LEN(data_modified)); /*  DateModifiedLength */
-        net_buf_add_utf16le(buf, data_modified); /* DateModified */
+        net_buf_add_u8(buf, MTP_STR_LEN(data_modified));    /*  DateModifiedLength */
+        net_buf_add_utf16le(buf, data_modified);            /* DateModified */
 
-        net_buf_add_u8(buf, 0); /*  KeywordsLength, always 0 unused */
-    } else if (obj_handle == 0x2) {
-        char* filename = "Test.txt";
-        char* data_created = "20241001T220015";
-        char* data_modified = "20241011T125813";
-        net_buf_add_le32(buf, 0x00010001);                  /* StorageID */
-        net_buf_add_le16(buf, MTP_FORMAT_TEXT);      /* ObjectFormat */
-        net_buf_add_le16(buf, OBJECT_PROTECTION_NO);        /* ProtectionStatus */
-        net_buf_add_le32(buf, KB(2));                /* ObjectCompressedSize */
-        net_buf_add_le16(buf, 0);                           /* ThumbFormat */
-        net_buf_add_le32(buf, 0);                           /* ThumbCompressedSize */
-        net_buf_add_le32(buf, 0);                           /* ThumbPixWidth */
-        net_buf_add_le32(buf, 0);                           /* ThumbPixHeight */
-        net_buf_add_le32(buf, 0);                           /* ImagePixWidth */
-        net_buf_add_le32(buf, 0);                           /* ImagePixHeight */
-        net_buf_add_le32(buf, 0);                           /* ImageBitDepth */
-        net_buf_add_le32(buf, 0xFFFFFFFFUL); /* Object in Root */                   /* ParentObject */
-        net_buf_add_le16(buf, 0x0001);                      /* AssociationType */
-        net_buf_add_le32(buf, 0);                           /* AssociationDesc */
-        net_buf_add_le32(buf, 0);                           /* SequenceNumber */
+        net_buf_add_u8(buf, 0);                             /*  KeywordsLength, always 0 unused */
 
-        net_buf_add_u8(buf, MTP_STR_LEN(filename) ); /* FileNameLength */
-        net_buf_add_utf16le(buf, filename); /* FileName */
-
-        net_buf_add_u8(buf, MTP_STR_LEN(data_created)); /* DateCreatedLength */
-        net_buf_add_utf16le(buf, data_created); /* DateCreated */
-
-        net_buf_add_u8(buf, MTP_STR_LEN(data_modified)); /*  DateModifiedLength */
-        net_buf_add_utf16le(buf, data_modified); /* DateModified */
-
-        net_buf_add_u8(buf, 0); /*  KeywordsLength, always 0 unused */
     } else {
-        LOG_ERR("Unknown file handle 0x%x", obj_handle);
+        LOG_ERR("Unknown Error ID %08x", obj_handle);
     }
 
     /* Add the Packet Header */
@@ -620,13 +724,14 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_PROP_DESC)
 }
 
 struct getfilestate_t{
+    struct fs_file_t file;
     uint32_t total_size;
     uint32_t sent;
+    uint32_t chunks_sent;
 };
 
 
-#define TEST_FILE_SIZE 2048
-#define MAX_PACKET_SIZE 512
+#define MAX_PACKET_SIZE 512  /* Get it in a usb complaint way */
 
 struct getfilestate_t filestate;
 uint8_t filebuf[512];
@@ -635,24 +740,35 @@ static int continue_get_object(struct net_buf *buf)
 {
     int len = 0;
     int total_chunks = (filestate.total_size / MAX_PACKET_SIZE);
-    static int chunks_sent = 0;
-    memset(filebuf,(filebuf[0]+1), 512);
+    memset(filebuf, 0x00, 512);
+
     if (filestate.sent < filestate.total_size) {
         len = MIN(MAX_PACKET_SIZE, (filestate.total_size - filestate.sent));
 
-        net_buf_add_mem(buf, filebuf, len);
+        int read = fs_read(&filestate.file, filebuf, len);
+        if (read <= 0) {
+            LOG_ERR("Failed to read file content %d", read);
+        }
+        net_buf_add_mem(buf, filebuf, read);
+
         filestate.sent += len;
-        chunks_sent++;
-        LOG_DBG("sent [%u of %u]: %u, remaining %u",chunks_sent,total_chunks, filestate.sent, (filestate.total_size-filestate.sent));
+        filestate.chunks_sent++;
+        LOG_DBG("sent [%u of %u]: %u, remaining %u",
+                        filestate.chunks_sent,total_chunks,
+                        filestate.sent,
+                        (filestate.total_size-filestate.sent));
+
         if (filestate.sent >= filestate.total_size){
-            filestate.total_size = 0;
-            filestate.sent = 0;
-            LOG_DBG("Done, CONFIRMING");
+            LOG_DBG("Done (%u), CONFIRMING", read);
+            fs_close(&filestate.file);
+            memset(&filestate, 0x00, sizeof(filestate));
             set_pending_packet(mtp_send_confirmation);
         } else {
-            LOG_DBG("Continue Next");
+            LOG_DBG("Continue (%u) Next", read);
             set_pending_packet(continue_get_object);
         }
+    } else {
+        LOG_ERR("shouldn't happen !!!!!!!!!");
     }
     return 0;
 }
@@ -670,22 +786,48 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     data_block.container_type = MTP_CONTAINER_DATA;
     data_block.response_code =  mtp_command->code;
     data_block.transaction_id = mtp_command->transaction_id;
+    uint32_t obj_handle = mtp_command->param[0];
+    uint8_t storage_id = GET_STORAGE_ID(obj_handle);
+    uint8_t object_id =  GET_OBJECT_ID(obj_handle);
+    const char* path = available_storages[storage_id].fileslist[object_id].path;
 
-    memset(filebuf, 'A', MAX_PACKET_SIZE);
-    //HelloWorld!
-    char* s = "HelloWorld!";
-    data_block.container_length = (sizeof(struct mtp_data_block) + TEST_FILE_SIZE);
+    data_block.container_length = (sizeof(struct mtp_data_block) + available_storages[storage_id].fileslist[object_id].size);
 
-    filestate.total_size = TEST_FILE_SIZE;
-    filestate.sent = 11;
+    fs_file_t_init(&filestate.file);
+	int err = fs_open(&filestate.file, path, FS_O_READ);
+	if (err) {
+		LOG_ERR("Failed to open %s (%d)", path, err);
+		return;
+	}
+
+    uint32_t filesize = available_storages[storage_id].fileslist[object_id].size;
+    uint32_t available_buf_len = MAX_PACKET_SIZE-sizeof(struct mtp_data_block);
+
+    LOG_DBG("Sending file: %s size: %u",
+     available_storages[storage_id].fileslist[object_id].path,
+     available_storages[storage_id].fileslist[object_id].size);
+
     net_buf_add_mem(buf,&data_block, sizeof(struct mtp_data_block));
-    net_buf_add_mem(buf,s, strlen(s));
+    if (available_storages[storage_id].fileslist[object_id].size > available_buf_len) {
+        int read = fs_read(&filestate.file, filebuf, available_buf_len);
+        if (read <= 0) {
+            LOG_ERR("Failed to read file content %d", read);
+        }
+        net_buf_add_mem(buf, filebuf, read);
 
-    net_buf_add_mem(buf, filebuf, (MAX_PACKET_SIZE-sizeof(struct mtp_data_block)-strlen(s)));
-    filestate.sent = strlen(s)+(MAX_PACKET_SIZE-sizeof(struct mtp_data_block)-strlen(s));
-    LOG_DBG("File Content Sent %u", filestate.sent);
-
-    set_pending_packet(continue_get_object);
+        filestate.total_size = filesize;
+        filestate.sent = read;
+        set_pending_packet(continue_get_object);
+    } else {
+        int read = fs_read(&filestate.file, filebuf, filesize);
+        if (read <= 0) {
+            LOG_ERR("Failed to read file content %d", read);
+        }
+        net_buf_add_mem(buf, filebuf, read);
+	    fs_close(&filestate.file);
+        memset(&filestate, 0x00, sizeof(filestate));
+        set_pending_packet(mtp_send_confirmation);
+    }
 }
 
 int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
@@ -814,6 +956,47 @@ static int mtp_send_confirmation(struct net_buf *buf)
     net_buf_add_mem(buf, &mtp_response, 12);
 
     clear_pending_packet();
+
+    return 0;
+}
+
+int mtp_init()
+{
+    LOG_INF("Found %u storages", ARRAY_SIZE(available_storages)-1);
+
+    for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
+        if (available_storages[i].files_count != 1){
+            return 0;
+        }
+        LOG_INF("Storage %u: %s", i, available_storages[i].mountpoint);
+
+        struct fs_statvfs stat;
+        int err = fs_statvfs(available_storages[i].mountpoint, &stat);
+        if (err < 0) {
+            LOG_ERR("Failed to statvfs %s (%d)", available_storages[i].mountpoint, err);
+            return -ENOEXEC;
+        }
+
+        LOG_INF("Max capacity %lu, freesize %lu, blocks %lu, bfree %lu\n",
+             stat.f_blocks * stat.f_frsize, stat.f_frsize * stat.f_bfree, stat.f_blocks, stat.f_bfree);
+
+        dir_traverse(i, available_storages[i].mountpoint, 0xFFFFFFFF);
+    }
+
+    for (int storageIdx=1; storageIdx< ARRAY_SIZE(available_storages); storageIdx++){
+        LOG_INF("File list Storage %s", available_storages[storageIdx].mountpoint);
+        for (int i=0;i<available_storages[storageIdx].files_count;i++)
+        {
+            LOG_INF("ID: 0x%08x S: %02x, P: %02x, T:%s, O: %02x : %s",
+                        available_storages[storageIdx].fileslist[i].ID,
+                        available_storages[storageIdx].fileslist[i].storage_id,
+                        available_storages[storageIdx].fileslist[i].parent_id,
+                        (available_storages[storageIdx].fileslist[i].type == 1 ? "D" : "f"),
+                        available_storages[storageIdx].fileslist[i].object_id,
+                        available_storages[storageIdx].fileslist[i].path);
+        }
+        LOG_INF("\n\n");
+    }
 
     return 0;
 }

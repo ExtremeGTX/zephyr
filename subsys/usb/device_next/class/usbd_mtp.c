@@ -74,7 +74,7 @@ struct mtp_device_status {
 };
 
 
-static void mtp_update(struct usbd_class_data *c_data,
+static void usbd_mtp_update(struct usbd_class_data *c_data,
 		      uint8_t iface, uint8_t alternate)
 {
 	LOG_WRN("Instance %p, interface %u alternate %u changed",
@@ -121,7 +121,7 @@ struct net_buf *mtp_buf_alloc(const uint8_t ep)
 	return buf;
 }
 
-static int mtp_control_to_host(struct usbd_class_data *c_data,
+static int usbd_mtp_control_to_host(struct usbd_class_data *c_data,
 			      const struct usb_setup_packet *const setup,
 			      struct net_buf *const buf)
 {
@@ -153,7 +153,7 @@ static int mtp_control_to_host(struct usbd_class_data *c_data,
 	return 0;
 }
 
-static int mtp_control_to_dev(struct usbd_class_data *c_data,
+static int usbd_mtp_control_to_dev(struct usbd_class_data *c_data,
 			     const struct usb_setup_packet *const setup,
 			     const struct net_buf *const buf)
 {
@@ -165,11 +165,11 @@ static int mtp_control_to_dev(struct usbd_class_data *c_data,
 	return 0;
 }
 
-static void mtp_enable(struct usbd_class_data *const c_data);
+static void usbd_mtp_enable(struct usbd_class_data *const c_data);
 
 #define USE_PENDING_FN  1
 
-static int mtp_request_handler(struct usbd_class_data *c_data,
+static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
 			      struct net_buf *buf, int err)
 {
         LOG_INF("\n\n");
@@ -233,25 +233,9 @@ static int mtp_request_handler(struct usbd_class_data *c_data,
                     net_buf_unref(buf_resp);
                 }
                 LOG_DBG("Pending DONE");
-#if 0
-                int loops = 0;
-                while (mtp_packet_pending())
-                {
-                    LOG_WRN("[Loop] ONE MORE PACKET PENDING %u", loops);
-                    mtp_enable(c_data);
-                    buf_resp = mtp_buf_alloc(MTP_IN_EP_ADDR);
-                    send_pending_packet(buf_resp);
-
-                    ret = usbd_ep_enqueue(c_data, buf_resp);
-                    if (ret) {
-                        LOG_ERR("[Loop] Failed to enqueue net_buf %d", ret);
-                        net_buf_unref(buf_resp);
-                    }
-                }
-#endif
             } else {
                 LOG_WRN("No Pending packet");
-                mtp_enable(c_data);
+                usbd_mtp_enable(c_data);
             }
             LOG_INF(BOLDWHITE"==[END] -> [Host Confirmed a reply]======================"RESET);
         } else {
@@ -267,7 +251,7 @@ static int mtp_request_handler(struct usbd_class_data *c_data,
 }
 
 /* Class associated configuration is selected */
-static void mtp_enable(struct usbd_class_data *const c_data)
+static void usbd_mtp_enable(struct usbd_class_data *const c_data)
 {
 	struct mtp_data *data = usbd_class_get_private(c_data);
 
@@ -287,14 +271,14 @@ static void mtp_enable(struct usbd_class_data *const c_data)
 }
 
 /* Class associated configuration is disabled */
-static void mtp_disable(struct usbd_class_data *const c_data)
+static void usbd_mtp_disable(struct usbd_class_data *const c_data)
 {
 	struct mtp_data *data = usbd_class_get_private(c_data);
 
 	LOG_ERR("**************Disable**************");
 }
 
-static void *mtp_get_desc(struct usbd_class_data *const c_data,
+static void *usbd_mtp_get_desc(struct usbd_class_data *const c_data,
 			 const enum usbd_speed speed)
 {
 	struct mtp_data *data = usbd_class_get_private(c_data);
@@ -306,22 +290,23 @@ static void *mtp_get_desc(struct usbd_class_data *const c_data,
 	return data->fs_desc;
 }
 
-static int mtp_init(struct usbd_class_data *c_data)
+static int usbd_mtp_init(struct usbd_class_data *c_data)
 {
-        LOG_DBG("Init class instance %p", c_data);
+        LOG_INF("Init class instance %p", c_data);
+        mtp_init();
 
         return 0;
 }
 
 struct usbd_class_api mtp_api = {
-    .update = mtp_update,
-	.control_to_dev = mtp_control_to_dev,
-	.control_to_host = mtp_control_to_host,
-	.request = mtp_request_handler,
-	.enable = mtp_enable,
-    .disable = mtp_disable,
-    .get_desc = mtp_get_desc,
-	.init = mtp_init,
+    .update = usbd_mtp_update,
+	.control_to_dev = usbd_mtp_control_to_dev,
+	.control_to_host = usbd_mtp_control_to_host,
+	.request = usbd_mtp_request_handler,
+	.enable = usbd_mtp_enable,
+    .disable = usbd_mtp_disable,
+    .get_desc = usbd_mtp_get_desc,
+	.init = usbd_mtp_init,
 };
 
 static struct mtp_desc mtp_desc_0 = {
