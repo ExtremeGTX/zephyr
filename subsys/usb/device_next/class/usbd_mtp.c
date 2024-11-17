@@ -37,7 +37,7 @@ __unused void buf_destroyed(struct net_buf *buf)
     allocated_bufs--;
     struct udc_buf_info *bi = udc_get_buf_info(buf);
     net_buf_destroy(buf);
-    LOG_WRN("BUF <Destroyed> %p EP: 0x%x (Allocated bufs: %d)", buf, bi->ep, allocated_bufs);
+    LOG_WRN("BUF <Destroyed> %p EP: %s (Allocated bufs: %d)", buf, bi->ep == 0x01 ? "OUT" : "IN", allocated_bufs);
 }
 
 UDC_BUF_POOL_DEFINE(mtp_ep_pool, 2, 512, sizeof(struct udc_buf_info), buf_destroyed);
@@ -116,7 +116,7 @@ struct net_buf *mtp_buf_alloc(const uint8_t ep)
 
 #if BUF_TRACE_DEBUG
     allocated_bufs++;
-    LOG_WRN("Buf >Allocated<: %p EP: 0x%x (Allocated bufs: %d)",buf, ep, allocated_bufs);
+    LOG_WRN("Buf >Allocated<: %p EP: %s (Allocated bufs: %d)",buf, ep == 0x01 ? "OUT" : "IN", allocated_bufs);
 #endif
 	return buf;
 }
@@ -167,8 +167,6 @@ static int usbd_mtp_control_to_dev(struct usbd_class_data *c_data,
 
 static void usbd_mtp_enable(struct usbd_class_data *const c_data);
 
-#define USE_PENDING_FN  1
-
 static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
 			      struct net_buf *buf, int err)
 {
@@ -210,11 +208,8 @@ static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
                                 bi->ep == 0x01 ? "MTP_OUT_EP_ADDR" : "MTP_IN_EP_ADDR",
                                 buf,
                                 buf->len);
-#if USE_PENDING_FN
+
             if (mtp_packet_pending()) {
-#else
-            if (mtp_confirmation_needed()) {
-#endif
                 LOG_INF("Sending Pending packet");
                 buf_resp = mtp_buf_alloc(MTP_IN_EP_ADDR);
                 if (buf_resp == NULL){
@@ -222,11 +217,8 @@ static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
                     LOG_ERR("REF COUNT %u", buf_resp->ref);
                     return -1;
                 }
-#if USE_PENDING_FN
+
                 send_pending_packet(buf_resp);
-#else
-                mtp_send_confirmation(buf_resp);
-#endif
                 ret = usbd_ep_enqueue(c_data, buf_resp);
                 if (ret) {
                     LOG_ERR("Failed to enqueue net_buf %d", ret);
@@ -265,6 +257,7 @@ static void usbd_mtp_enable(struct usbd_class_data *const c_data)
     if (ret) {
         LOG_ERR("Init Failed to enqueue net_buf %d", ret);
         net_buf_unref(bufp);
+        return;
     }
 
 	LOG_INF("Ready to receive from HOST");
