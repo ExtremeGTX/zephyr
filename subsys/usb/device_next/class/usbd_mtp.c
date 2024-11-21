@@ -40,9 +40,9 @@ __unused void buf_destroyed(struct net_buf *buf)
     LOG_WRN("BUF <Destroyed> %p EP: %s (Allocated bufs: %d)", buf, bi->ep == 0x01 ? "OUT" : "IN", allocated_bufs);
 }
 
-UDC_BUF_POOL_DEFINE(mtp_ep_pool, 2, 512, sizeof(struct udc_buf_info), buf_destroyed);
+UDC_BUF_POOL_DEFINE(mtp_ep_pool, 10, 512, sizeof(struct udc_buf_info), buf_destroyed);
 #else
-UDC_BUF_POOL_DEFINE(mtp_ep_pool, 2, 512, sizeof(struct udc_buf_info), NULL);
+UDC_BUF_POOL_DEFINE(mtp_ep_pool, 10, 512, sizeof(struct udc_buf_info), NULL);
 #endif
 
 struct mtp_desc {
@@ -178,11 +178,25 @@ static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
         int ret = 0;
 
         struct net_buf* buf_resp = NULL;
-
+#if 0
+        // Send pending interrupts
+        struct net_buf* buf_int = mtp_buf_alloc(MTP_INTR_EP_ADDR);
+        handle_pending_interrupt(buf_int);
+        if (buf_int->len != 0){
+            ret = usbd_ep_enqueue(c_data, buf_int);
+            if (ret) {
+                LOG_ERR("Failed to enqueue net_buf %d", ret);
+                net_buf_unref(buf_int);
+            }
+        } else {
+            LOG_WRN("No Interrupts Pending");
+            net_buf_unref(buf_int);
+        }
+#endif
         if (bi->ep == MTP_OUT_EP_ADDR) {
             LOG_INF(BOLDWHITE"==[START] -> [Host Sent a command]========================="RESET);
             LOG_INF("%s: %p -> ep 0x%02x, buf: %p len %u, err %d",__func__, c_data, bi->ep, buf, buf->len, err);
-            LOG_HEXDUMP_INF(buf->data, buf->len, "mtp_request_handler");
+            //LOG_HEXDUMP_INF(buf->data, buf->len, "mtp_request_handler");
             buf_resp = mtp_buf_alloc(MTP_IN_EP_ADDR);
             if (buf_resp == NULL){
                 LOG_ERR("%s: Buffer allocation failed!", __func__);
@@ -191,17 +205,27 @@ static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
             }
             ret = mtp_commands_handler(buf, buf_resp);
             if (ret) {
+                ret = usbd_ep_enqueue(c_data, buf_resp);
+                if (ret) {
+                    LOG_ERR("Failed to enqueue net_buf %d", ret);
+                    net_buf_unref(buf_resp);
+                } else {
+                    LOG_DBG("[replied to Host ... DONE]");
+                }
+            } else if (ret < 0) {
+                net_buf_unref(buf_resp);
                 LOG_ERR("mtp_commands_handler failed");
-                return -1;
+            } else if (ret == 0) {
+                net_buf_unref(buf_resp);
+                LOG_WRN("Nothing to Send!");
+                usbd_mtp_enable(c_data);
+
             }
 
-            ret = usbd_ep_enqueue(c_data, buf_resp);
-            if (ret) {
-                LOG_ERR("Failed to enqueue net_buf %d", ret);
-                net_buf_unref(buf_resp);
-            } else {
-                LOG_DBG("[replied to Host ... DONE]");
+            if(mtp_needs_more_data(buf)) {
+                LOG_INF("Alloc EXTRA Buffer");
             }
+
         } else if (bi->ep == MTP_IN_EP_ADDR) {
             LOG_WRN("Host event EP: %x[%s] (buf %p, len: %u)",
                                 bi->ep,
@@ -231,7 +255,7 @@ static int usbd_mtp_request_handler(struct usbd_class_data *c_data,
             }
             LOG_INF(BOLDWHITE"==[END] -> [Host Confirmed a reply]======================"RESET);
         } else {
-            LOG_ERR("SHOULDN'T BE HERE!");
+            LOG_ERR("SHOULDN'T BE HERE! buf->len: %u", buf->len);
         }
 
         LOG_INF(BOLDWHITE"==[mtp_request_handler]==== Destroy buf %p EP: 0x%x [%s] ====="RESET,

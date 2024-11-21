@@ -57,13 +57,12 @@
 			automount;
 			mtp-enabled;
 		};
-	};
-
-	msc_disk0 {
-		status="okay";
-		compatible = "zephyr,flash-disk";
-		partition = <&storage_partition>;
-		disk-name = "NAND";
-		cache-size = <512>;
+// Not Working
+//		sd0: sd0 {
+//			compatible = "zephyr,fstab-common";
+//			partition = <&sdmmc2>;
+//			mount-point = "/SD:";
+//			automount;
+//		};
 	};
 };

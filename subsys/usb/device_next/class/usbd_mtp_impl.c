@@ -45,6 +45,7 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 #define MTP_OP_GET_OBJECT_PROP_DESC         0x9802
 #define MTP_OP_GET_OBJECT_PROP_VALUE        0x9803
 #define MTP_OP_SET_OBJECT_PROP_VALUE        0x9804
+#define MTP_OP_GET_OBJECT_REFERENCES        0x9810
 #define MTP_OP_SET_OBJECT_REFERENCES        0x9811
 #define MTP_OP_SKIP                         0x9820
 
@@ -52,10 +53,12 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 #define MTP_RESP_OK                         0x2001
 #define MTP_RESP_GENERAL_ERROR              0x2002
 #define MTP_RESP_SESSION_NOT_OPEN           0x2003
+#define MTP_RESP_OPERATION_NOT_SUPPORTED    0x2005
 #define MTP_RESP_SESSION_ALREADY_OPEN       0x201E
 #define MTP_RESP_INVALID_OBJECT_HANDLE      0x2009
 
 /* MTP Image Formats */
+#define MTP_FORMAT_UNDEFINED                0x3000
 #define MTP_FORMAT_ASSOCIATION              0x3001
 #define MTP_FORMAT_TEXT                     0x3004
 
@@ -106,9 +109,17 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
             mtp_##opcode(bufp, mtp_command);    \
             } while(0);
 
+#define MTP_CMD2(opcode) do {                    \
+            mtp_##opcode(bufp, mtp_command, buf);    \
+            } while(0);
+
 #define MTP_CMD_HANDLER(opcode)					    \
 static void mtp_##opcode(struct net_buf *buf,       \
                         struct mtp_container* mtp_command)
+
+#define MTP_CMD_HANDLER2(opcode)					    \
+static void mtp_##opcode(struct net_buf *buf,       \
+                        struct mtp_container* mtp_command, struct net_buf *recv_buf)
 
 #define FSTAB_NODE DT_PATH(fstab)
 
@@ -155,26 +166,23 @@ static const uint16_t mtp_operations[] = {
     MTP_OP_CLOSE_SESSION,
     MTP_OP_GET_STORAGE_IDS,
     MTP_OP_GET_STORAGE_INFO,
-    MTP_OP_GET_NUM_OBJECTS,
     MTP_OP_GET_OBJECT_HANDLES,
     MTP_OP_GET_OBJECT_INFO,
     MTP_OP_GET_OBJECT,
     MTP_OP_DELETE_OBJECT,
     MTP_OP_SEND_OBJECT_INFO,
     MTP_OP_SEND_OBJECT,
-    MTP_OP_RESET_DEVICE,
     MTP_OP_MOVE_OBJECT,
     MTP_OP_COPY_OBJECT,
-    MTP_OP_GET_PARTIAL_OBJECT,
-    MTP_OP_SET_OBJECT_REFERENCES,
-    MTP_OP_SKIP
+    MTP_OP_GET_DEVICE_PROP_DESC,
+    MTP_OP_GET_DEVICE_PROP_VALUE,
+    MTP_OP_SET_DEVICE_PROP_VALUE,
+    MTP_OP_GET_OBJECT_REFERENCES,
 };
 
 static const uint16_t events_supported[] = {
     MTP_EVENT_OBJECT_ADDED,
     MTP_EVENT_OBJECT_REMOVED,
-    MTP_EVENT_STORE_ADDED,
-    MTP_EVENT_STORE_REMOVED,
     MTP_EVENT_DEVICE_PROP_CHANGED,
     MTP_EVENT_OBJECT_INFO_CHANGED
 };
@@ -184,8 +192,8 @@ static const uint16_t device_properties[] = {
 };
 
 static const uint16_t playback_formats[] = {
+    MTP_FORMAT_UNDEFINED,
     MTP_FORMAT_ASSOCIATION,
-    MTP_FORMAT_TEXT
 };
 
 struct fs_object_t {
@@ -200,7 +208,7 @@ struct fs_object_t {
     };
     uint32_t size;
     char path[MAX_PATH_LEN];
-    char name[MAX_PATH_LEN];
+    char name[MAX_FILE_NAME];
 };
 
 
@@ -253,6 +261,7 @@ const char* mtp_code_to_string(uint16_t code)
         case 0x9802: str = "GetObjectPropDesc"      ; break;
         case 0x9803: str = "GetObjectPropValue"     ; break;
         case 0x9804: str = "SetObjectPropValue"     ; break;
+        case 0x9810: str = "GetObjectReferences"    ; break;
         case 0x9811: str = "SetObjectReferences"    ; break;
         case 0x9820: str = "Skip"                   ; break;
 
@@ -320,15 +329,19 @@ static void net_buf_add_utf16le(struct net_buf *buf, const char* str)
 	}
 }
 
-static int mtp_send_confirmation(struct net_buf *buf);
+static void net_buf_pull_utf16le(struct net_buf *buf, char* strbuf, size_t len)
+{
+    for (int i=0; i < len; ++i) {
+        strbuf[i] = net_buf_pull_u8(buf);
+        net_buf_pull_u8(buf);
+    }
+}
 
+
+static int mtp_send_confirmation(struct net_buf *buf);
+/* ================== Pending packet handling ================ */
 typedef int (pending_fn_t)(struct net_buf *buf);
 static pending_fn_t* pending_fn = NULL;
-
-static void clear_pending_packet()
-{
-    pending_fn = NULL;
-}
 
 static void set_pending_packet(pending_fn_t* pend_fn)
 {
@@ -338,9 +351,9 @@ static void set_pending_packet(pending_fn_t* pend_fn)
 int send_pending_packet(struct net_buf *buf)
 {
     if (pending_fn) {
-        //pending_fn_t* lpfn = pending_fn;
-        //clear_pending_packet();
-        return pending_fn(buf);
+        pending_fn_t* lpfn = pending_fn;
+        pending_fn = NULL;
+        return lpfn(buf);
     } else {
         return -EINVAL;
     }
@@ -348,9 +361,57 @@ int send_pending_packet(struct net_buf *buf)
 
 bool mtp_packet_pending()
 {
-    //LOG_DBG("Pending check");
     return (pending_fn != NULL);
 }
+/* ===================== Extra Data needed handling =============== */
+
+typedef int (extra_data_fn_t)(struct net_buf *buf, struct net_buf *buf_recv);
+static extra_data_fn_t* extra_data_fn = NULL;
+
+
+static bool more_data_needed = false;
+static void set_needs_more_data(bool more_data)
+{
+    more_data_needed = more_data;
+}
+
+bool mtp_needs_more_data(struct net_buf *buf)
+{
+    bool val = more_data_needed;
+    more_data_needed = false;
+    return val;
+}
+
+int handle_extra_data(struct net_buf *buf, struct net_buf *buf_recv)
+{
+    if (extra_data_fn) {
+        extra_data_fn_t* lpfn = extra_data_fn;
+        extra_data_fn = NULL;
+        return lpfn(buf, buf_recv);
+    } else {
+        return -EINVAL;
+    }
+}
+/* ===================== Interrupt handling =============== */
+#if 0
+static bool interrupt_pending = false;
+static uint32_t new_object_event_id = 0x00;
+static uint32_t new_object_trans_id = 0x00;
+void handle_pending_interrupt(struct net_buf *buf)
+{
+    interrupt_pending = false;
+    if (interrupt_pending) {
+        struct mtp_container ev1 = {
+            .length = 16,
+            .type = MTP_CONTAINER_EVENT,
+            .code = 0x4002,
+            .transaction_id = new_object_trans_id+2,
+            .param[0] = new_object_event_id
+        };
+        net_buf_add_mem(buf, &ev1, 16);
+    }
+}
+#endif
 
 MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 {
@@ -362,7 +423,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 
     //net_buf_add_mem(buf, &data_block, sizeof(struct mtp_data_block));
 
-    const char* vendor_extension_desc = "microsoft.com: 1.0; android.com: 1.0;";
+    const char* vendor_extension_desc = "microsoft.com: 1.0;";
     const char* manufacturer = "Zephyr";
     const char* model = "ZephyrMTP";
     const char* device_version = "2.0";
@@ -374,8 +435,9 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
     net_buf_add_le16(buf, 100);    /* vendor_extension_version */
 
     /* Vendor extension description in UTF-16LE */
-    net_buf_add_u8(buf, MTP_STR_LEN(vendor_extension_desc));   /* length */
-    net_buf_add_utf16le(buf, vendor_extension_desc);        /* string value */
+    net_buf_add_u8(buf, 0);   /* length */
+    //net_buf_add_u8(buf, MTP_STR_LEN(vendor_extension_desc));   /* length */
+    //net_buf_add_utf16le(buf, vendor_extension_desc);        /* string value */
 
     /* functional_mode; */
     net_buf_add_le16(buf, 0);
@@ -462,7 +524,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 
     net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);                  /* type */
     net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);            /* fs_type */
-    net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);             /* access_caps */
+    net_buf_add_le16(buf, OBJECT_PROTECTION_NO);                    /* access_caps */
     net_buf_add_le64(buf, (stat.f_blocks * stat.f_frsize));         /* max_capacity */
     net_buf_add_le64(buf, (stat.f_bfree * stat.f_frsize));          /* free_space */
     net_buf_add_le32(buf, 0xFFFFFFFF);                              /* free_space_obj */
@@ -586,7 +648,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
     uint32_t found_files = 0;
     uint32_t parent_id = (obj_handle == 0xffffffff ? 0xff : GET_OBJECT_ID(obj_handle));
     for (int i=0;i<available_storages[storage_id].files_count;++i) {
-        LOG_WRN("Comparing Req:%x %x", parent_id, available_storages[storage_id].fileslist[i].parent_id);
+        //LOG_DBG("Comparing Req:%x %x", parent_id, available_storages[storage_id].fileslist[i].parent_id);
         if (available_storages[storage_id].fileslist[i].parent_id == parent_id) {
             net_buf_add_le32(buf, available_storages[storage_id].fileslist[i].ID);
             found_files++;
@@ -613,7 +675,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
     uint32_t obj_handle = mtp_command->param[0];
     uint8_t storage_id = GET_STORAGE_ID(obj_handle);
     uint8_t object_id =  GET_OBJECT_ID(obj_handle);
-    LOG_DBG("\n\t\tObjHandle: 0x%x\n", mtp_command->param[0]);
+    LOG_DBG("\n\t\tObjHandle: 0x%x, SID: %x, OID: %x", mtp_command->param[0], storage_id, object_id);
 
     if (available_storages[storage_id].fileslist[object_id].ID == obj_handle) {
         char* filename = available_storages[storage_id].fileslist[object_id].name;
@@ -625,7 +687,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
         if (available_storages[storage_id].fileslist[object_id].type == 1) {
             net_buf_add_le16(buf, MTP_FORMAT_ASSOCIATION);  /* ObjectFormat */
         } else {
-            net_buf_add_le16(buf, MTP_FORMAT_TEXT);         /* ObjectFormat */
+            net_buf_add_le16(buf, MTP_FORMAT_UNDEFINED);    /* ObjectFormat */
         }
 
         net_buf_add_le16(buf, OBJECT_PROTECTION_NO);        /* ProtectionStatus */
@@ -725,7 +787,9 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_PROP_DESC)
 
 struct getfilestate_t{
     struct fs_file_t file;
+    struct fs_file_t file2;
     uint32_t total_size;
+    uint32_t transferred;
     uint32_t sent;
     uint32_t chunks_sent;
 };
@@ -830,6 +894,196 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     }
 }
 
+char date_created[25];
+char date_modified[25];
+
+MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
+{
+    LOG_DBG("\n\t\tDest StorageID: 0x%x"
+            "\n\t\tDest ParentHandle: 0x%x"
+            "\n\t\tParam2: 0x%x",
+            mtp_command->param[0],
+            mtp_command->param[1],
+            mtp_command->param[2]);
+
+
+    static int pkt_counter = 0;
+    pkt_counter++;
+    uint32_t dest_storage_id = mtp_command->param[0] & 0x0F;
+    uint32_t dest_parent_handle = mtp_command->param[1];
+
+
+    /* first packet received from Host contains only, destination storageID and Destination ParentID */
+    if (pkt_counter == 1) {
+
+        LOG_DBG("dest SID:%x destP:%x currentfilecount %u",
+                    dest_storage_id,
+                    dest_parent_handle,
+                    available_storages[dest_storage_id].files_count);
+
+        if (dest_storage_id != 0 && dest_storage_id < ARRAY_SIZE(available_storages)) {
+            if ((available_storages[dest_storage_id].files_count + 1) <  MAX_FILES)
+            {
+                uint32_t new_obj_id = available_storages[dest_storage_id].files_count++;
+
+                available_storages[dest_storage_id].fileslist[new_obj_id].object_id = new_obj_id;
+                available_storages[dest_storage_id].fileslist[new_obj_id].type = 0;
+                available_storages[dest_storage_id].fileslist[new_obj_id].parent_id = dest_parent_handle;
+                available_storages[dest_storage_id].fileslist[new_obj_id].storage_id = dest_storage_id;
+
+                LOG_INF("New ObjID:  0x%08x", available_storages[dest_storage_id].fileslist[new_obj_id].ID);
+                set_needs_more_data(true);
+            } else {
+                LOG_ERR("No file handle avaiable %u", available_storages[dest_storage_id].files_count);
+            }
+        } else {
+            LOG_ERR("Unkown storage id %x", dest_storage_id);
+        }
+    } else if (pkt_counter == 2) { /* Host sent more info */
+
+        char* filepath = available_storages[1].fileslist[available_storages[1].files_count - 1].path;
+        char* filename = available_storages[1].fileslist[available_storages[1].files_count - 1].name;
+
+        memset(filename,0x00, MAX_FILE_NAME);
+        memset(filepath,0x00, MAX_PATH_LEN);
+        memset(date_created,0x00, 25);
+        memset(date_modified,0x00, 25);
+        uint8_t str_len = 0;
+        // Skip header
+        net_buf_pull(recv_buf, sizeof(struct mtp_data_block));
+        uint32_t StorageID = net_buf_pull_le32(recv_buf);                             /* StorageID */
+        uint16_t ObjectFormat = net_buf_pull_le16(recv_buf);                             /* ObjectFormat */
+        uint16_t ProtectionStatus = net_buf_pull_le16(recv_buf);                             /* ProtectionStatus */
+        uint32_t ObjectCompressedSize = net_buf_pull_le32(recv_buf);                             /* ObjectCompressedSize */
+
+        net_buf_pull_le16(recv_buf);                             /* ThumbFormat */
+        net_buf_pull_le32(recv_buf);                             /* ThumbCompressedSize */
+        net_buf_pull_le32(recv_buf);                             /* ThumbPixWidth */
+        net_buf_pull_le32(recv_buf);                             /* ThumbPixHeight */
+        net_buf_pull_le32(recv_buf);                             /* ImagePixWidth */
+        net_buf_pull_le32(recv_buf);                             /* ImagePixHeight */
+        net_buf_pull_le32(recv_buf);                             /* ImageBitDepth */
+        uint32_t ParentObject = net_buf_pull_le32(recv_buf);     /* ParentObject (0xFFFF if Object in Root) */
+        net_buf_pull_le16(recv_buf);                             /* AssociationType */
+        net_buf_pull_le32(recv_buf);                             /* AssociationDesc */
+        net_buf_pull_le32(recv_buf);                             /* SequenceNumber */
+        str_len = net_buf_pull_u8(recv_buf);                     /* FileNameLength */
+        net_buf_pull_utf16le(recv_buf, filename, str_len);
+
+        str_len = net_buf_pull_u8(recv_buf);     /* DateCreatedLength */
+        net_buf_pull_utf16le(recv_buf, date_created, str_len);             /* DateCreated */
+
+        str_len = net_buf_pull_u8(recv_buf);    /* DateModifiedLength */
+        net_buf_pull_utf16le(recv_buf, date_modified, str_len);            /* DateModified */
+        net_buf_pull_u8(recv_buf);                             /* KeywordsLength, always 0 unused */
+
+        printk("\nStorageID: %x, oFormat: %x, protection: %x, size: %x, parent: %x\n",
+                StorageID, ObjectFormat, ProtectionStatus, ObjectCompressedSize, ParentObject);
+        printk("\nfname: %s\n",filename);
+        printk("\ncreated_on: %s\n", date_created);
+        printk("\nmodified_on: %s\n", date_modified);
+
+
+
+        snprintf(filepath, MAX_PATH_LEN, "%s/%s", available_storages[1].mountpoint, filename);
+        available_storages[1].fileslist[available_storages[1].files_count - 1].size = ObjectCompressedSize;
+
+        printk("\npath: %s ID:%x\n", filepath, available_storages[1].fileslist[available_storages[1].files_count - 1].ID);
+        fs_file_t_init(&filestate.file2);
+        int ret = fs_open(&filestate.file2, filepath, FS_O_CREATE | FS_O_WRITE);
+        if (ret) {
+            LOG_ERR("Open file failed, %d", ret);
+        }
+        filestate.total_size = ObjectCompressedSize;
+
+        new_object_event_id = available_storages[1].fileslist[available_storages[1].files_count - 1].ID;
+        struct mtp_container mtp_response = {
+            .length = 24,
+            .type = MTP_CONTAINER_RESPONSE,
+            .code = MTP_RESP_OK,
+            .transaction_id = mtp_command->transaction_id,
+            .param[0] = 0x10001,
+            .param[1] = 0x0,
+            .param[2] = available_storages[1].fileslist[available_storages[1].files_count - 1].ID
+        };
+        net_buf_add_mem(buf, &mtp_response, 24);
+        interrupt_pending = true;
+
+    }
+}
+
+int extra_data_handler(struct net_buf* buf,struct net_buf* buf_recv)
+{
+    static bool remove_header = true;
+    if (remove_header){
+        net_buf_pull(buf, sizeof(struct mtp_data_block)); // skip header
+        remove_header = false;
+    }
+
+    LOG_INF("Chunk %u, data len: %u", filestate.chunks_sent, buf->len);
+    filestate.transferred += buf->len;
+    filestate.chunks_sent++;
+
+    fs_write(&filestate.file2, buf->data, buf->len);
+    if (filestate.transferred >= filestate.total_size) {
+        fs_close(&filestate.file2);
+        LOG_INF("Sending Confirmation after reciving data (Total len: %u)", filestate.transferred);
+        LOG_INF("Old filecount %u", available_storages[1].files_count);
+
+        filestate.chunks_sent=0;
+        filestate.transferred=0;
+        filestate.total_size=0;
+
+        mtp_send_confirmation(buf_recv);
+    } else {
+        extra_data_fn = extra_data_handler;
+        set_needs_more_data(true);
+    }
+    return 0;
+}
+
+MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT)
+{
+    LOG_INF("Chunk %u, data len: %u", filestate.chunks_sent, buf->len);
+    struct mtp_data_block *mdb = net_buf_pull_mem(recv_buf,12);
+
+    net_buf_pull(recv_buf, sizeof(struct mtp_data_block)); // skip header
+
+    fs_write(&filestate.file2, buf->data, buf->len);
+    extra_data_fn = extra_data_handler;
+    set_needs_more_data(true);
+    filestate.chunks_sent++;
+    filestate.transferred += buf->len;
+    new_object_trans_id = mdb->transaction_id;
+    return;
+}
+
+MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_REFERENCES)
+{
+    struct mtp_data_block data_block;
+
+    data_block.container_type = MTP_CONTAINER_DATA;
+    data_block.response_code =  mtp_command->code;
+    data_block.transaction_id = mtp_command->transaction_id;
+
+    uint32_t objcount = 0;
+
+    for (int i=0; i < available_storages[1].files_count; i++) {
+        if (available_storages[1].fileslist[i].parent_id == 0xff) {
+            objcount++;
+            net_buf_add_le32(buf, available_storages[1].fileslist[i].ID);
+        }
+    }
+
+    net_buf_push_le32(buf, objcount);
+
+    /* Add the Packet Header */
+    data_block.container_length = (sizeof(struct mtp_data_block) + buf->len);
+    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
+
+    set_pending_packet(mtp_send_confirmation);
+}
+
 int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
 {
     if (bufp == NULL){
@@ -837,11 +1091,9 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         return -EINVAL;
     }
 
-    if (buf->len > sizeof(struct mtp_container)) {
-        LOG_ERR("%s: Malformed data, discarded", __func__);
-        return -EINVAL;
+    if (handle_extra_data(buf, bufp) == 0) {
+        return bufp->len;
     }
-
 
     struct mtp_container* mtp_command = (struct mtp_container*)buf->data;
     LOG_DBG(GREEN "[%s]" RESET, mtp_code_to_string(mtp_command->code));
@@ -883,10 +1135,10 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         LOG_ERR("MTP_OP_DELETE_OBJECT Not Implemented!");
         break;
     case MTP_OP_SEND_OBJECT_INFO:
-        LOG_ERR("MTP_OP_SEND_OBJECT_INFO Not Implemented!");
+        MTP_CMD2(MTP_OP_SEND_OBJECT_INFO);
         break;
     case MTP_OP_SEND_OBJECT:
-        LOG_ERR("MTP_OP_SEND_OBJECT Not Implemented!");
+        MTP_CMD2(MTP_OP_SEND_OBJECT);
         break;
     case MTP_OP_RESET_DEVICE:
         LOG_ERR("MTP_OP_RESET_DEVICE Not Implemented!");
@@ -908,6 +1160,9 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         break;
     case MTP_OP_COPY_OBJECT:
         LOG_ERR("MTP_OP_COPY_OBJECT Not Implemented!");
+        break;
+    case MTP_OP_GET_OBJECT_REFERENCES:
+        MTP_CMD(MTP_OP_GET_OBJECT_REFERENCES);
         break;
     case MTP_OP_GET_PARTIAL_OBJECT:
         LOG_ERR("MTP_OP_GET_PARTIAL_OBJECT Not Implemented!");
@@ -935,10 +1190,32 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
     break;
     }
 
-    return 0;
+    return bufp->len;
 }
 
+#if 0
+bool mtp_needs_more_data(struct net_buf *buf)
+{
+    static int require = true;
+    struct mtp_container* mtp_command = (struct mtp_container*)buf->data;
 
+    switch (mtp_command->code)
+    {
+    case MTP_OP_SEND_OBJECT:
+    case MTP_OP_SEND_OBJECT_INFO:
+        if (require){
+            require = false;
+            return true;
+        }
+        return false;
+        break;
+
+    default:
+        return false;
+        break;
+    }
+}
+#endif
 static int mtp_send_confirmation(struct net_buf *buf)
 {
     if (buf == NULL){
@@ -955,13 +1232,12 @@ static int mtp_send_confirmation(struct net_buf *buf)
     };
     net_buf_add_mem(buf, &mtp_response, 12);
 
-    clear_pending_packet();
-
     return 0;
 }
 
 int mtp_init()
 {
+    fs_unlink("/lfs1/desktop.ini");
     LOG_INF("Found %u storages", ARRAY_SIZE(available_storages)-1);
 
     for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
