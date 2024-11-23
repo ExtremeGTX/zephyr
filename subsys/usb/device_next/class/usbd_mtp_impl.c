@@ -647,9 +647,9 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
         net_buf_add_le32(buf, 0);                           /* ImagePixWidth */
         net_buf_add_le32(buf, 0);                           /* ImagePixHeight */
         net_buf_add_le32(buf, 0);                           /* ImageBitDepth */
-        if (available_storages[storage_id].fileslist[object_id].parent_id == 0xffff) {
+        if (available_storages[storage_id].fileslist[object_id].parent_id == 0xff) {
             LOG_DBG("%s in root", available_storages[storage_id].fileslist[object_id].name);
-            net_buf_add_le32(buf, 0xFFFFFFFFUL);            /* ParentObject (0xFFFF if Object in Root) */
+            net_buf_add_le32(buf, 0xFFFFFFFFUL);            /* ParentObject (0xFF if Object in Root) */
         } else {
             LOG_DBG("%s in parent %x",
                     available_storages[storage_id].fileslist[object_id].name,
@@ -816,23 +816,18 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
 
 MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
 {
-    LOG_DBG("\n\t\tDest StorageID: 0x%x"
-            "\n\t\tDest ParentHandle: 0x%x"
-            "\n\t\tParam2: 0x%x",
-            mtp_command->param[0],
-            mtp_command->param[1],
-            mtp_command->param[2]);
-
     static struct fs_object_t *fs_obj = NULL;
 
     /* first packet received from Host contains only, destination storageID and Destination ParentID */
     if (fs_obj == NULL) {
+        LOG_DBG("\n\t\tDest StorageID: 0x%x"
+                "\n\t\tDest ParentHandle: 0x%x, resolved 0x%x",
+                mtp_command->param[0],
+                mtp_command->param[1],
+                GET_OBJECT_ID(mtp_command->param[1]));
+
         uint32_t dest_storage_id = mtp_command->param[0] & 0x0F;
         uint32_t dest_parent_handle = mtp_command->param[1];
-        LOG_DBG("dest SID:%x destP:%x currentfilecount %u",
-                    dest_storage_id,
-                    dest_parent_handle,
-                    available_storages[dest_storage_id].files_count);
 
         if (dest_storage_id != 0 && dest_storage_id < ARRAY_SIZE(available_storages)) {
             if ((available_storages[dest_storage_id].files_count + 1) <  MAX_FILES)
@@ -842,7 +837,7 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
 
                 fs_obj->object_id = new_obj_id;
                 fs_obj->type = 0;
-                fs_obj->parent_id = dest_parent_handle;
+                fs_obj->parent_id = (dest_parent_handle == 0xffffffff ? 0xffffffff : GET_OBJECT_ID(dest_parent_handle));
                 fs_obj->storage_id = dest_storage_id;
 
                 LOG_INF("New ObjID:  0x%08x", fs_obj->ID);
@@ -864,10 +859,13 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
         uint8_t str_len = 0;
 
         net_buf_pull(recv_buf, sizeof(struct mtp_data_block));              /* SKIP the header */
-        uint32_t StorageID = net_buf_pull_le32(recv_buf);                   /* StorageID */
+        net_buf_pull_le32(recv_buf);                                        /* StorageID, always 0 ignore */
         uint16_t ObjectFormat = net_buf_pull_le16(recv_buf);                /* ObjectFormat */
-        uint16_t ProtectionStatus = net_buf_pull_le16(recv_buf);            /* ProtectionStatus */
-        uint32_t ObjectCompressedSize = net_buf_pull_le32(recv_buf);        /* ObjectCompressedSize */
+        if (ObjectFormat == MTP_FORMAT_ASSOCIATION) {
+            fs_obj->type = 1;
+        }
+        net_buf_pull_le16(recv_buf);            /* ProtectionStatus */
+        fs_obj->size = net_buf_pull_le32(recv_buf);        /* ObjectCompressedSize */
 
         net_buf_pull_le16(recv_buf);                                        /* ThumbFormat */
         net_buf_pull_le32(recv_buf);                                        /* ThumbCompressedSize */
@@ -890,11 +888,23 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
         net_buf_pull_utf16le(recv_buf, date_modified, str_len);             /* DateModified */
         net_buf_pull_u8(recv_buf);                                          /* KeywordsLength, always 0 unused */
 
-        snprintf(filepath, MAX_PATH_LEN, "%s/%s", available_storages[1].mountpoint, filename);
-        fs_obj->size = ObjectCompressedSize;
+        if (fs_obj->parent_id==0xff){
+            snprintf(filepath, MAX_PATH_LEN, "%s/%s", available_storages[fs_obj->storage_id].mountpoint, filename);
+        } else {
+            printk("mnt: %s\n", available_storages[fs_obj->storage_id].mountpoint);
+            printk("fname: %s\n",filename);
+            printk("parentID: %u\n",fs_obj->parent_id);
+            printf("parentPath:%s\n",
+                    available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].name);
 
-        printk("\nStorageID: %x, oFormat: %x, protection: %x, size: %x, parent: %x\n",
-                StorageID, ObjectFormat, ProtectionStatus, ObjectCompressedSize, ParentObject);
+            snprintf(filepath, MAX_PATH_LEN, "%s/%s/%s",
+                    available_storages[fs_obj->storage_id].mountpoint,
+                    available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].name,
+                    filename);
+        }
+
+        printk("\noFormat: %x, size: %x, parent: %x\n",
+                ObjectFormat, fs_obj->size, ParentObject);
         printk("\nfname: %s\n",filename);
         printk("\ncreated_on: %s\n", date_created);
         printk("\nmodified_on: %s\n", date_modified);
@@ -905,7 +915,7 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
         if (ret) {
             LOG_ERR("Open file failed, %d", ret);
         }
-        mtp_ctx.filestate.total_size = ObjectCompressedSize;
+        mtp_ctx.filestate.total_size = fs_obj->size;
 
         struct mtp_container mtp_response = {
             .length = 24,
@@ -913,7 +923,7 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
             .code = MTP_RESP_OK,
             .transaction_id = mtp_command->transaction_id,
             .param[0] = 0x10001,
-            .param[1] = ParentObject,
+            .param[1] = available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].ID,
             .param[2] = fs_obj->ID
         };
 
