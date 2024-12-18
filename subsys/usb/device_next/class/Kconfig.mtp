@@ -9,6 +9,30 @@ config USBD_MTP_CLASS
 	  Allow file transfer independent of storage file system.
 
 if USBD_MTP_CLASS
+
+config USBD_MTP_ALLOW_WRITE
+	bool "MTP Allow write"
+	help
+	  Allow writing to the storage exposed over MTP.
+	  storage protection level has precedence over this config
+
+config USBD_MTP_MAX_HANDLES
+	int "Max number of Object handles"
+	default 10
+	help
+	  Maximum number of objects to be handled by MTP, including
+	  stored, removed and added objects.
+
+config USBD_MTP_ALLOW_MOVING_OBJECTS
+	bool "MTP Allow move"
+	help
+	  Enable moving objects within the exposed storage without relying on the host.
+
+config USBD_MTP_ALLOW_COPYING_OBJECTS
+	bool "MTP Allow copy"
+	help
+	  Enable copying objects within the exposed storage without relying on the host.
+
 module = USBD_MTP
 module-str = usbd mtp
 default-count = 1

@@ -87,20 +87,13 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 #define MTP_STR_LEN(str)    (strlen(str)+1)
 
 #define MTP_CMD(opcode) do {                    \
-            mtp_##opcode(bufp, mtp_command);    \
-            } while(0);
-
-#define MTP_CMD2(opcode) do {                    \
-            mtp_##opcode(bufp, mtp_command, buf);    \
+            mtp_##opcode(mtp_command, payload, buf);    \
             } while(0);
 
 #define MTP_CMD_HANDLER(opcode)					    \
-static void mtp_##opcode(struct net_buf *buf,       \
-                        struct mtp_container* mtp_command)
-
-#define MTP_CMD_HANDLER2(opcode)					    \
-static void mtp_##opcode(struct net_buf *buf,       \
-                        struct mtp_container* mtp_command, struct net_buf *recv_buf)
+static void mtp_##opcode(struct mtp_container* mtp_command, \
+                         struct net_buf *payload, \
+                         struct net_buf *buf)
 
 #define FSTAB_NODE DT_PATH(fstab)
 
@@ -119,21 +112,18 @@ enum mtp_container_type {
     MTP_CONTAINER_RESPONSE,
     MTP_CONTAINER_EVENT,
 };
+struct mtp_header {
+    uint32_t length;  // Total length of the response block
+    uint16_t type;    // Should be 0x0002 for Data Block
+    uint16_t code;     // MTP response code (e.g., MTP_RESP_OK)
+    uint32_t transaction_id;    // Transaction ID of the command being responded to
+} __packed;
 
 struct mtp_container {
-    uint32_t length;            // Total length of the command block
-    uint16_t type;              // Should be 0x0001 for Command Block
-    uint16_t code;              // MTP operation code (e.g., MTP_OP_OPEN_SESSION)
-    uint32_t transaction_id;    // Transaction ID to track the command
+    struct mtp_header hdr;
     uint32_t param[5];          // Optional Parameter 1 (e.g., session ID)
 } __packed;
 
-struct mtp_data_block {
-    uint32_t container_length;  // Total length of the response block
-    uint16_t container_type;    // Should be 0x0002 for Data Block
-    uint16_t response_code;     // MTP response code (e.g., MTP_RESP_OK)
-    uint32_t transaction_id;    // Transaction ID of the command being responded to
-} __packed;
 
 /* Constants */
 static const uint16_t mtp_operations[] = {
@@ -171,21 +161,6 @@ static const uint16_t playback_formats[] = {
     MTP_FORMAT_ASSOCIATION,
 };
 
-struct fs_object_t {
-    union {
-        struct {
-            uint8_t object_id;
-            uint8_t type;
-            uint8_t parent_id;
-            uint8_t storage_id;
-        };
-        uint32_t ID; // Allows access to the entire ID as a single value
-    };
-    uint32_t size;
-    char path[MAX_PATH_LEN];
-    char name[MAX_FILE_NAME];
-};
-
 char date_created[25];
 char date_modified[25];
 
@@ -203,6 +178,20 @@ struct mtp_context {
     } filestate;
 } mtp_ctx;
 
+struct fs_object_t {
+    union {
+        struct {
+            uint8_t object_id;
+            uint8_t type;
+            uint8_t parent_id;
+            uint8_t storage_id;
+        };
+        uint32_t ID; // Allows access to the entire ID as a single value
+    };
+    uint32_t size;
+    char path[MAX_PATH_LEN];
+    char name[MAX_FILE_NAME];
+};
 struct storage_t {
     const char mountpoint[10];
     struct fs_object_t fileslist[MAX_FILES];
@@ -386,136 +375,12 @@ int handle_extra_data(struct net_buf *buf, struct net_buf *buf_recv)
 void data_header_push(struct net_buf* buf, struct mtp_container* mtp_command, uint32_t data_len)
 {
     /* DATA Block Header */
-    struct mtp_data_block data_block;
-    data_block.container_type = MTP_CONTAINER_DATA;
-    data_block.response_code = mtp_command->code;
-    data_block.transaction_id = mtp_command->transaction_id;
-    data_block.container_length = (sizeof(struct mtp_data_block) + data_len);
-    net_buf_push_mem(buf, &data_block, sizeof(struct mtp_data_block));
-}
-
-MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
-{
-    const char* manufacturer = "Zephyr";
-    const char* model = "ZephyrMTP";
-    const char* device_version = "2.0";
-    const char* serial_number = "0123456789ABCDEF";
-
-    /* Device Info */
-    net_buf_add_le16(buf, 100);    /* standard_version = MTP version 1.00 */
-    net_buf_add_le32(buf, 6);      /* vendor_extension_id = MTP standard extension ID (Microsoft) */
-    net_buf_add_le16(buf, 100);    /* vendor_extension_version */
-
-    /* No Vendor extension is supported */
-    net_buf_add_u8(buf, 0);        /* Unused */
-
-    /* functional_mode; */
-    net_buf_add_le16(buf, 0);
-
-    /* operations supported */
-    net_buf_add_le32(buf, ARRAY_SIZE(mtp_operations));                  /* count */
-    net_buf_add_mem(buf, mtp_operations, sizeof(mtp_operations));       /* operations_supported[] */
-
-    /* events supported */
-    net_buf_add_le32(buf, ARRAY_SIZE(events_supported));                /* count */
-    net_buf_add_mem(buf, events_supported, sizeof(events_supported));   /* events_supported[] */
-
-    /* Device properties supported */
-    net_buf_add_le32(buf, ARRAY_SIZE(device_properties));               /* count */
-    net_buf_add_mem(buf, device_properties, sizeof(device_properties)); /* device_properties_supported[] */
-
-    /* Capture formats count */
-    net_buf_add_le32(buf, 0);
-
-    /* Playback formats supported */
-    net_buf_add_le32(buf, ARRAY_SIZE(playback_formats));                /* count */
-    net_buf_add_mem(buf, playback_formats, sizeof(playback_formats));   /* playback_formats[] */
-
-    net_buf_add_u8(buf, MTP_STR_LEN(manufacturer));                     /* manufacturer_len */
-    net_buf_add_utf16le(buf, manufacturer);                             /* manufacturer[] */
-
-    net_buf_add_u8(buf, MTP_STR_LEN(model));                            /* model_len; */
-    net_buf_add_utf16le(buf, model);                                    /* model[] */
-
-    net_buf_add_u8(buf, MTP_STR_LEN(device_version));                   /* device_version_len; */
-    net_buf_add_utf16le(buf, device_version);                           /* device_version[] */
-
-    net_buf_add_u8(buf, MTP_STR_LEN(serial_number));                    /* serial_number_len; */
-    net_buf_add_utf16le(buf, serial_number);                            /* serial_number[] */
-
-    /* Add the Packet Header */
-    data_header_push(buf, mtp_command, buf->len);
-
-    set_pending_packet(mtp_send_confirmation);
-}
-
-
-MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
-{
-    struct mtp_container mtp_response = {
-        .length = 12,
-        .type = MTP_CONTAINER_RESPONSE,
-        .code = MTP_RESP_OK,
-        .transaction_id = mtp_command->transaction_id
-    };
-
-    net_buf_add_mem(buf, &mtp_response, 12);
-}
-
-
-MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
-{
-    uint32_t requested_storage_id = mtp_command->param[0] & 0x0F;
-
-    LOG_DBG("\n\t\tStorageID    : 0x%x\n", requested_storage_id);
-
-    if (requested_storage_id == 0){
-        LOG_ERR("Unknown Storage ID %x", requested_storage_id);
-    }
-
-    struct fs_statvfs stat;
-    int err = fs_statvfs(available_storages[requested_storage_id].mountpoint, &stat);
-    if (err < 0) {
-        LOG_ERR("Failed to statvfs %s (%d)", available_storages[requested_storage_id].mountpoint, err);
-        return;
-    }
-
-    const char* storage_name = available_storages[requested_storage_id].mountpoint;
-    if (storage_name[0] == '/') {
-        /* skip the slash */
-        storage_name++;
-    }
-
-    net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);                  /* type */
-    net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);            /* fs_type */
-    net_buf_add_le16(buf, OBJECT_PROTECTION_NO);                    /* access_caps */
-    net_buf_add_le64(buf, (stat.f_blocks * stat.f_frsize));         /* max_capacity */
-    net_buf_add_le64(buf, (stat.f_bfree * stat.f_frsize));          /* free_space */
-    net_buf_add_le32(buf, 0xFFFFFFFF);                              /* free_space_obj */
-    net_buf_add_u8(buf, MTP_STR_LEN(storage_name));                 /* storage_desc_len */
-    net_buf_add_utf16le(buf, storage_name);                         /* storage_desc[] */
-    net_buf_add_u8(buf, 0);                                         /* volume_id_len, Unused */
-
-    /* Add the Packet Header */
-    data_header_push(buf, mtp_command, buf->len);
-
-
-    set_pending_packet(mtp_send_confirmation);
-}
-
-MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
-{
-    net_buf_add_le32(buf, ARRAY_SIZE(available_storages)-1); /* Number of Storages */
-    for (int i=1; i < ARRAY_SIZE(available_storages); i++)
-    {
-        net_buf_add_le32(buf, GEN_INTERNAL_STORAGE_ID(i)); /* Use array index as Storage ID, 0x00 can't be used */
-    }
-
-    /* Add the Packet Header */
-    data_header_push(buf, mtp_command, buf->len);
-
-
-    set_pending_packet(mtp_send_confirmation);
+    struct mtp_header hdr;
+    hdr.type = MTP_CONTAINER_DATA;
+    hdr.code = mtp_command->hdr.code;
+    hdr.transaction_id = mtp_command->hdr.transaction_id;
+    hdr.length = (sizeof(struct mtp_header) + data_len);
+    net_buf_push_mem(buf, &hdr, sizeof(struct mtp_header));
 }
 
 static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t parent)
@@ -576,6 +441,150 @@ static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t pare
     fs_closedir(&dir);
 
     return 0;
+}
+
+MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
+{
+    const char* manufacturer = "Zephyr";
+    const char* model = "ZephyrMTP";
+    const char* device_version = "2.0";
+    const char* serial_number = "0123456789ABCDEF";
+
+    /* Device Info */
+    net_buf_add_le16(buf, 100);    /* standard_version = MTP version 1.00 */
+    net_buf_add_le32(buf, 6);      /* vendor_extension_id = MTP standard extension ID (Microsoft) */
+    net_buf_add_le16(buf, 100);    /* vendor_extension_version */
+
+    /* No Vendor extension is supported */
+    net_buf_add_u8(buf, 0);        /* Unused */
+
+    /* functional_mode; */
+    net_buf_add_le16(buf, 0);
+
+    /* operations supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(mtp_operations));                  /* count */
+    net_buf_add_mem(buf, mtp_operations, sizeof(mtp_operations));       /* operations_supported[] */
+
+    /* events supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(events_supported));                /* count */
+    net_buf_add_mem(buf, events_supported, sizeof(events_supported));   /* events_supported[] */
+
+    /* Device properties supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(device_properties));               /* count */
+    net_buf_add_mem(buf, device_properties, sizeof(device_properties)); /* device_properties_supported[] */
+
+    /* Capture formats count */
+    net_buf_add_le32(buf, 0);
+
+    /* Playback formats supported */
+    net_buf_add_le32(buf, ARRAY_SIZE(playback_formats));                /* count */
+    net_buf_add_mem(buf, playback_formats, sizeof(playback_formats));   /* playback_formats[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(manufacturer));                     /* manufacturer_len */
+    net_buf_add_utf16le(buf, manufacturer);                             /* manufacturer[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(model));                            /* model_len; */
+    net_buf_add_utf16le(buf, model);                                    /* model[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(device_version));                   /* device_version_len; */
+    net_buf_add_utf16le(buf, device_version);                           /* device_version[] */
+
+    net_buf_add_u8(buf, MTP_STR_LEN(serial_number));                    /* serial_number_len; */
+    net_buf_add_utf16le(buf, serial_number);                            /* serial_number[] */
+
+    /* Add the Packet Header */
+    data_header_push(buf, mtp_command, buf->len);
+
+    set_pending_packet(mtp_send_confirmation);
+}
+
+
+MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
+{
+    for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
+        dir_traverse(i, available_storages[i].mountpoint, 0xFFFFFFFF);
+    }
+
+    struct mtp_header mtp_response = {
+        .length = sizeof(struct mtp_header),
+        .type = MTP_CONTAINER_RESPONSE,
+        .code = MTP_RESP_OK,
+        .transaction_id = mtp_command->hdr.transaction_id
+    };
+
+    net_buf_add_mem(buf, &mtp_response, sizeof(struct mtp_header));
+}
+
+MTP_CMD_HANDLER(MTP_OP_CLOSE_SESSION)
+{
+    for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
+        memset(available_storages[i].fileslist, 0x00, sizeof(available_storages[i].fileslist));
+        available_storages[i].files_count = 0;
+    }
+
+    struct mtp_header mtp_response = {
+        .length = sizeof(struct mtp_header),
+        .type = MTP_CONTAINER_RESPONSE,
+        .code = MTP_RESP_OK,
+        .transaction_id = mtp_command->hdr.transaction_id
+    };
+
+    net_buf_add_mem(buf, &mtp_response, sizeof(struct mtp_header));
+}
+
+
+MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
+{
+    uint32_t requested_storage_id = mtp_command->param[0] & 0x0F;
+
+    LOG_DBG("\n\t\tStorageID    : 0x%x\n", requested_storage_id);
+
+    if (requested_storage_id == 0){
+        LOG_ERR("Unknown Storage ID %x", requested_storage_id);
+    }
+
+    struct fs_statvfs stat;
+    int err = fs_statvfs(available_storages[requested_storage_id].mountpoint, &stat);
+    if (err < 0) {
+        LOG_ERR("Failed to statvfs %s (%d)", available_storages[requested_storage_id].mountpoint, err);
+        return;
+    }
+
+    const char* storage_name = available_storages[requested_storage_id].mountpoint;
+    if (storage_name[0] == '/') {
+        /* skip the slash */
+        storage_name++;
+    }
+
+    net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);                  /* type */
+    net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL);            /* fs_type */
+    net_buf_add_le16(buf, OBJECT_PROTECTION_NO);                    /* access_caps */
+    net_buf_add_le64(buf, (stat.f_blocks * stat.f_frsize));         /* max_capacity */
+    net_buf_add_le64(buf, (stat.f_bfree * stat.f_frsize));          /* free_space */
+    net_buf_add_le32(buf, 0xFFFFFFFF);                              /* free_space_obj */
+    net_buf_add_u8(buf, MTP_STR_LEN(storage_name));                 /* storage_desc_len */
+    net_buf_add_utf16le(buf, storage_name);                         /* storage_desc[] */
+    net_buf_add_u8(buf, 0);                                         /* volume_id_len, Unused */
+
+    /* Add the Packet Header */
+    data_header_push(buf, mtp_command, buf->len);
+
+
+    set_pending_packet(mtp_send_confirmation);
+}
+
+MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
+{
+    net_buf_add_le32(buf, ARRAY_SIZE(available_storages)-1); /* Number of Storages */
+    for (int i=1; i < ARRAY_SIZE(available_storages); i++)
+    {
+        net_buf_add_le32(buf, GEN_INTERNAL_STORAGE_ID(i)); /* Use array index as Storage ID, 0x00 can't be used */
+    }
+
+    /* Add the Packet Header */
+    data_header_push(buf, mtp_command, buf->len);
+
+    set_pending_packet(mtp_send_confirmation);
 }
 
 #define GET_OBJECT_ID(objID)   ((uint8_t)(objID & 0xFF))
@@ -782,7 +791,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
 	}
 
     uint32_t filesize = available_storages[storage_id].fileslist[object_id].size;
-    uint32_t available_buf_len = MAX_PACKET_SIZE-sizeof(struct mtp_data_block);
+    uint32_t available_buf_len = MAX_PACKET_SIZE-sizeof(struct mtp_header);
 
     LOG_DBG("Sending file: %s size: %u",
      available_storages[storage_id].fileslist[object_id].path,
@@ -813,7 +822,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     }
 }
 
-MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
+MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
 {
     static struct fs_object_t *fs_obj = NULL;
 
@@ -851,41 +860,37 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
         char* filepath = fs_obj->path;
         char* filename = fs_obj->name;
 
-        //memset(filename,0x00, MAX_FILE_NAME);
-        //memset(filepath,0x00, MAX_PATH_LEN);
-        //memset(date_created,0x00, 25);
-        //memset(date_modified,0x00, 25);
         uint8_t str_len = 0;
 
-        net_buf_pull(recv_buf, sizeof(struct mtp_data_block));              /* SKIP the header */
-        net_buf_pull_le32(recv_buf);                                        /* StorageID, always 0 ignore */
-        uint16_t ObjectFormat = net_buf_pull_le16(recv_buf);                /* ObjectFormat */
+        net_buf_pull(payload, sizeof(struct mtp_header));                  /* SKIP the header */
+        net_buf_pull_le32(payload);                                        /* StorageID, always 0 ignore */
+        uint16_t ObjectFormat = net_buf_pull_le16(payload);                /* ObjectFormat */
         if (ObjectFormat == MTP_FORMAT_ASSOCIATION) {
             fs_obj->type = 1;
         }
-        net_buf_pull_le16(recv_buf);            /* ProtectionStatus */
-        fs_obj->size = net_buf_pull_le32(recv_buf);        /* ObjectCompressedSize */
+        net_buf_pull_le16(payload);                                        /* ProtectionStatus */
+        fs_obj->size = net_buf_pull_le32(payload);                         /* ObjectCompressedSize */
 
-        net_buf_pull_le16(recv_buf);                                        /* ThumbFormat */
-        net_buf_pull_le32(recv_buf);                                        /* ThumbCompressedSize */
-        net_buf_pull_le32(recv_buf);                                        /* ThumbPixWidth */
-        net_buf_pull_le32(recv_buf);                                        /* ThumbPixHeight */
-        net_buf_pull_le32(recv_buf);                                        /* ImagePixWidth */
-        net_buf_pull_le32(recv_buf);                                        /* ImagePixHeight */
-        net_buf_pull_le32(recv_buf);                                        /* ImageBitDepth */
-        uint32_t ParentObject = net_buf_pull_le32(recv_buf);                /* ParentObject (0xFFFF if Object in Root) */
-        net_buf_pull_le16(recv_buf);                                        /* AssociationType */
-        net_buf_pull_le32(recv_buf);                                        /* AssociationDesc */
-        net_buf_pull_le32(recv_buf);                                        /* SequenceNumber */
-        str_len = net_buf_pull_u8(recv_buf);                                /* FileNameLength */
-        net_buf_pull_utf16le(recv_buf, filename, str_len);                  /* FileName */
+        net_buf_pull_le16(payload);                                        /* ThumbFormat */
+        net_buf_pull_le32(payload);                                        /* ThumbCompressedSize */
+        net_buf_pull_le32(payload);                                        /* ThumbPixWidth */
+        net_buf_pull_le32(payload);                                        /* ThumbPixHeight */
+        net_buf_pull_le32(payload);                                        /* ImagePixWidth */
+        net_buf_pull_le32(payload);                                        /* ImagePixHeight */
+        net_buf_pull_le32(payload);                                        /* ImageBitDepth */
+        uint32_t ParentObject = net_buf_pull_le32(payload);                /* ParentObject (0xFFFF if Object in Root) */
+        net_buf_pull_le16(payload);                                        /* AssociationType */
+        net_buf_pull_le32(payload);                                        /* AssociationDesc */
+        net_buf_pull_le32(payload);                                        /* SequenceNumber */
+        str_len = net_buf_pull_u8(payload);                                /* FileNameLength */
+        net_buf_pull_utf16le(payload, filename, str_len);                  /* FileName */
 
-        str_len = net_buf_pull_u8(recv_buf);                                /* DateCreatedLength */
-        net_buf_pull_utf16le(recv_buf, date_created, str_len);              /* DateCreated */
+        str_len = net_buf_pull_u8(payload);                                /* DateCreatedLength */
+        net_buf_pull_utf16le(payload, date_created, str_len);              /* DateCreated */
 
-        str_len = net_buf_pull_u8(recv_buf);                                /* DateModifiedLength */
-        net_buf_pull_utf16le(recv_buf, date_modified, str_len);             /* DateModified */
-        net_buf_pull_u8(recv_buf);                                          /* KeywordsLength, always 0 unused */
+        str_len = net_buf_pull_u8(payload);                                /* DateModifiedLength */
+        net_buf_pull_utf16le(payload, date_modified, str_len);             /* DateModified */
+        net_buf_pull_u8(payload);                                          /* KeywordsLength, always 0 unused */
 
         if (fs_obj->parent_id==0xff){
             snprintf(filepath, MAX_PATH_LEN, "%s/%s", available_storages[fs_obj->storage_id].mountpoint, filename);
@@ -918,10 +923,12 @@ MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT_INFO)
         mtp_ctx.filestate.total_size = fs_obj->size;
 
         struct mtp_container mtp_response = {
-            .length = 24,
-            .type = MTP_CONTAINER_RESPONSE,
-            .code = MTP_RESP_OK,
-            .transaction_id = mtp_command->transaction_id,
+            .hdr = {
+                .length = 24,
+                .type = MTP_CONTAINER_RESPONSE,
+                .code = MTP_RESP_OK,
+                .transaction_id = mtp_command->hdr.transaction_id,
+            },
             .param[0] = GEN_INTERNAL_STORAGE_ID(fs_obj->storage_id),
             .param[1] = (fs_obj->parent_id == 0xff ? 0xffffffff : available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].ID),
             .param[2] = fs_obj->ID
@@ -957,18 +964,18 @@ int extra_data_handler(struct net_buf* buf,struct net_buf* buf_recv)
     return 0;
 }
 
-MTP_CMD_HANDLER2(MTP_OP_SEND_OBJECT)
+MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT)
 {
-    if (mtp_command->type == MTP_CONTAINER_COMMAND) {
-        LOG_INF("COMMAND RECEIVED len: %u", recv_buf->len);
-    } else if (mtp_command->type == MTP_CONTAINER_DATA) {
-        LOG_INF("DATA RECEIVED len: %u", recv_buf->len);
-        net_buf_pull_mem(recv_buf,12);
-        fs_write(&mtp_ctx.filestate.file, recv_buf->data, recv_buf->len);
+    if (mtp_command->hdr.type == MTP_CONTAINER_COMMAND) {
+        LOG_INF("COMMAND RECEIVED len: %u", payload->len);
+    } else if (mtp_command->hdr.type == MTP_CONTAINER_DATA) {
+        LOG_INF("DATA RECEIVED len: %u", payload->len); /* SKIP The header */
+        net_buf_pull_mem(payload,sizeof(struct mtp_header));
+        fs_write(&mtp_ctx.filestate.file, payload->data, payload->len);
         extra_data_fn = extra_data_handler;
         set_needs_more_data(true);
         mtp_ctx.filestate.chunks_sent++;
-        mtp_ctx.filestate.transferred += recv_buf->len;
+        mtp_ctx.filestate.transferred += payload->len;
         LOG_INF("SEND_OBJECT: Data len: %u out of %u", mtp_ctx.filestate.transferred, mtp_ctx.filestate.total_size);
     }
 
@@ -983,14 +990,14 @@ MTP_CMD_HANDLER(MTP_OP_DELETE_OBJECT)
     char* filepath = available_storages[storage_id].fileslist[object_id].path;
     fs_unlink(filepath);
 
-    struct mtp_container mtp_response = {
-        .length = 12,
+    struct mtp_header mtp_response = {
+        .length = sizeof(struct mtp_header),
         .type = MTP_CONTAINER_RESPONSE,
         .code = MTP_RESP_OK,
-        .transaction_id = mtp_command->transaction_id
+        .transaction_id = mtp_command->hdr.transaction_id
     };
 
-    net_buf_add_mem(buf, &mtp_response, 12);
+    net_buf_add_mem(buf, &mtp_response, sizeof(struct mtp_header));
 }
 
 MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_REFERENCES)
@@ -1011,18 +1018,23 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_REFERENCES)
     set_pending_packet(mtp_send_confirmation);
 }
 
-int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
+int mtp_commands_handler(struct net_buf *buf_in, struct net_buf *buf)
 {
-    if (bufp == NULL){
+    if (buf == NULL){
         LOG_ERR("%s: NULL Buffer", __func__);
         return -EINVAL;
     }
 
-    if (handle_extra_data(bufp, buf) == 0) {
-        return bufp->len;
+    if (handle_extra_data(buf, buf_in) == 0) {
+        return buf->len;
     }
+    //FIXME: Send mtp_header or mtp_container ? some commands has 0 params, some has 3 params
+    //Leave skipping up to the command handler since we can't anticipate how many params should
+    //be skipped
+    //net_buf_pull_mem(buf_in, sizeof(struct mtp_header));
+    struct mtp_header* mtp_command = (struct mtp_header*)buf_in->data;
+    struct net_buf *payload = buf_in;
 
-    struct mtp_container* mtp_command = (struct mtp_container*)buf->data;
     LOG_DBG(GREEN "[%s]" RESET, mtp_code_to_string(mtp_command->code));
 
     switch(mtp_command->code)
@@ -1035,7 +1047,7 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         MTP_CMD(MTP_OP_OPEN_SESSION);
         break;
     case MTP_OP_CLOSE_SESSION:
-        LOG_ERR("MTP_OP_CLOSE_SESSION not implemented!");
+        MTP_CMD(MTP_OP_CLOSE_SESSION);
     break;
     case MTP_OP_GET_STORAGE_IDS:
         MTP_CMD(MTP_OP_GET_STORAGE_IDS);
@@ -1056,10 +1068,10 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
         MTP_CMD(MTP_OP_DELETE_OBJECT);
         break;
     case MTP_OP_SEND_OBJECT_INFO:
-        MTP_CMD2(MTP_OP_SEND_OBJECT_INFO);
+        MTP_CMD(MTP_OP_SEND_OBJECT_INFO);
         break;
     case MTP_OP_SEND_OBJECT:
-        MTP_CMD2(MTP_OP_SEND_OBJECT);
+        MTP_CMD(MTP_OP_SEND_OBJECT);
         break;
     case MTP_OP_GET_DEVICE_PROP_DESC:
         MTP_CMD(MTP_OP_GET_DEVICE_PROP_DESC);
@@ -1084,7 +1096,7 @@ int mtp_commands_handler(struct net_buf *buf, struct net_buf *bufp)
     break;
     }
 
-    return bufp->len;
+    return buf->len;
 }
 
 static int mtp_send_confirmation(struct net_buf *buf)
@@ -1095,19 +1107,21 @@ static int mtp_send_confirmation(struct net_buf *buf)
     }
 
     struct mtp_container* mtp_command = (struct mtp_container*)buf->data;
-    struct mtp_container mtp_response = {
-        .length = 12,
+    struct mtp_header mtp_response = {
+        .length = sizeof(struct mtp_header),
         .type = MTP_CONTAINER_RESPONSE,
         .code = MTP_RESP_OK,
-        .transaction_id = mtp_command->transaction_id
+        .transaction_id = mtp_command->hdr.transaction_id
     };
-    net_buf_add_mem(buf, &mtp_response, 12);
+
+    net_buf_add_mem(buf, &mtp_response, sizeof(struct mtp_header));
 
     return 0;
 }
 
 int mtp_init()
 {
+#if 0
     fs_unlink("/lfs1/desktop.ini");
     LOG_INF("Found %u storages", ARRAY_SIZE(available_storages)-1);
 
@@ -1144,6 +1158,6 @@ int mtp_init()
         }
         LOG_INF("\n\n");
     }
-
+#endif
     return 0;
 }
