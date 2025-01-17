@@ -6,6 +6,7 @@
 
 #include <zephyr/usb/usbd.h>
 #include <zephyr/drivers/usb/udc.h>
+#include "usbd_mtp_impl.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usb_mtp, 3); //CONFIG_USBD_MTP_LOG_LEVEL
@@ -40,9 +41,9 @@ __unused void buf_destroyed(struct net_buf *buf)
     LOG_WRN("BUF <Destroyed> %p EP: %s (Allocated bufs: %d)", buf, bi->ep == 0x01 ? "OUT" : "IN", allocated_bufs);
 }
 
-UDC_BUF_POOL_DEFINE(mtp_ep_pool, 10, 512, sizeof(struct udc_buf_info), buf_destroyed);
+UDC_BUF_POOL_DEFINE(mtp_ep_pool, 3, 512, sizeof(struct udc_buf_info), buf_destroyed);
 #else
-UDC_BUF_POOL_DEFINE(mtp_ep_pool, 10, 512, sizeof(struct udc_buf_info), NULL);
+UDC_BUF_POOL_DEFINE(mtp_ep_pool, 3, 512, sizeof(struct udc_buf_info), NULL);
 #endif
 
 struct mtp_desc {
@@ -310,7 +311,7 @@ static void *usbd_mtp_get_desc(struct usbd_class_data *const c_data,
 static int usbd_mtp_init(struct usbd_class_data *c_data)
 {
         LOG_INF("Init class instance %p", c_data);
-        mtp_init();
+        //mtp_init();
 
         return 0;
 }
