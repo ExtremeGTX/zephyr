@@ -197,12 +197,12 @@ struct fs_object_t {
 };
 struct storage_t {
     const char mountpoint[10];
-    struct fs_object_t fileslist[MAX_FILES];
+    struct fs_object_t filelist[CONFIG_USBD_MTP_MAX_HANDLES];
     uint16_t files_count;
 };
 
 
-static struct storage_t available_storages[] = {
+static struct storage_t storage[] = {
     {.mountpoint = "NULL"},
     DT_FOREACH_CHILD(DT_PATH(fstab), PROCESS_FSTAB_ENTRY)
 };
@@ -379,10 +379,12 @@ void data_header_push(struct net_buf* buf, struct mtp_container* mtp_command, ui
 {
     /* DATA Block Header */
     struct mtp_header hdr;
+
     hdr.type = MTP_CONTAINER_DATA;
     hdr.code = mtp_command->hdr.code;
     hdr.transaction_id = mtp_command->hdr.transaction_id;
     hdr.length = (sizeof(struct mtp_header) + data_len);
+
     net_buf_push_mem(buf, &hdr, sizeof(struct mtp_header));
 }
 
@@ -391,7 +393,7 @@ static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t pare
     char path[MAX_PATH_LEN];
     struct fs_dir_t dir;
     int err;
-    struct storage_t* sstorage = &available_storages[storage_id];
+    struct storage_t* sstorage = &storage[storage_id];
 
     fs_dir_t_init(&dir);
 
@@ -421,19 +423,19 @@ static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t pare
         // If it's a file, store the path in the array
         if (sstorage->files_count < MAX_FILES) {
 #if STORE_OBJECT_PATH
-            strncpy(sstorage->fileslist[sstorage->files_count].path, path, MAX_PATH_LEN - 1);
+            strncpy(sstorage->filelist[sstorage->files_count].path, path, MAX_PATH_LEN - 1);
 #endif
-            strncpy(sstorage->fileslist[sstorage->files_count].name, entry.name, MAX_PATH_LEN - 1);
-            sstorage->fileslist[sstorage->files_count].size = entry.size;
-            sstorage->fileslist[sstorage->files_count].type = (entry.type == FS_DIR_ENTRY_DIR ? 1 : 0) ;
-            sstorage->fileslist[sstorage->files_count].parent_id = parent;
-            sstorage->fileslist[sstorage->files_count].object_id = sstorage->files_count;
-            sstorage->fileslist[sstorage->files_count].storage_id = storage_id;
+            strncpy(sstorage->filelist[sstorage->files_count].name, entry.name, MAX_PATH_LEN - 1);
+            sstorage->filelist[sstorage->files_count].size = entry.size;
+            sstorage->filelist[sstorage->files_count].type = (entry.type == FS_DIR_ENTRY_DIR ? 1 : 0) ;
+            sstorage->filelist[sstorage->files_count].parent_id = parent;
+            sstorage->filelist[sstorage->files_count].object_id = sstorage->files_count;
+            sstorage->filelist[sstorage->files_count].storage_id = storage_id;
             sstorage->files_count++;
 
             if (entry.type == FS_DIR_ENTRY_DIR) {
                 // Recursive call to traverse subdirectory
-                dir_traverse(storage_id, path, sstorage->fileslist[sstorage->files_count-1].object_id);
+                dir_traverse(storage_id, path, sstorage->filelist[sstorage->files_count-1].object_id);
             }
 
         } else {
@@ -461,7 +463,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
     net_buf_add_le16(buf, 100);    /* vendor_extension_version */
 
     /* No Vendor extension is supported */
-    net_buf_add_u8(buf, 0);        /* Unused */
+    net_buf_add_u8(buf, 0);
 
     /* functional_mode; */
     net_buf_add_le16(buf, 0);
@@ -522,9 +524,9 @@ MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
 
 MTP_CMD_HANDLER(MTP_OP_CLOSE_SESSION)
 {
-    for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
-        memset(available_storages[i].fileslist, 0x00, sizeof(available_storages[i].fileslist));
-        available_storages[i].files_count = 0;
+    for (int i=1; i < ARRAY_SIZE(storage); i++) {
+        memset(storage[i].filelist, 0x00, sizeof(storage[i].filelist));
+        storage[i].files_count = 0;
     }
 
     struct mtp_header mtp_response = {
@@ -549,13 +551,13 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
     }
 
     struct fs_statvfs stat;
-    int err = fs_statvfs(available_storages[requested_storage_id].mountpoint, &stat);
+    int err = fs_statvfs(storage[requested_storage_id].mountpoint, &stat);
     if (err < 0) {
-        LOG_ERR("Failed to statvfs %s (%d)", available_storages[requested_storage_id].mountpoint, err);
+        LOG_ERR("Failed to statvfs %s (%d)", storage[requested_storage_id].mountpoint, err);
         return;
     }
 
-    const char* storage_name = available_storages[requested_storage_id].mountpoint;
+    const char* storage_name = storage[requested_storage_id].mountpoint;
     if (storage_name[0] == '/') {
         /* skip the slash */
         storage_name++;
@@ -580,8 +582,8 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 
 MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_IDS)
 {
-    net_buf_add_le32(buf, ARRAY_SIZE(available_storages)-1); /* Number of Storages */
-    for (int i=1; i < ARRAY_SIZE(available_storages); i++)
+    net_buf_add_le32(buf, ARRAY_SIZE(storage)-1); /* Number of storage */
+    for (int i=1; i < ARRAY_SIZE(storage); i++)
     {
         net_buf_add_le32(buf, INTERNAL_STORAGE_ID(i)); /* Use array index as Storage ID, 0x00 can't be used */
     }
@@ -610,10 +612,10 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_HANDLES)
 
     uint32_t found_files = 0;
     uint32_t parent_id = (obj_handle == 0xffffffff ? 0xff : GET_OBJECT_ID(obj_handle));
-    for (int i=0;i<available_storages[storage_id].files_count;++i) {
-        //LOG_DBG("Comparing Req:%x %x", parent_id, available_storages[storage_id].fileslist[i].parent_id);
-        if (available_storages[storage_id].fileslist[i].parent_id == parent_id) {
-            net_buf_add_le32(buf, available_storages[storage_id].fileslist[i].ID);
+    for (int i=0;i<storage[storage_id].files_count;++i) {
+        //LOG_DBG("Comparing Req:%x %x", parent_id, storage[storage_id].filelist[i].parent_id);
+        if (storage[storage_id].filelist[i].parent_id == parent_id) {
+            net_buf_add_le32(buf, storage[storage_id].filelist[i].ID);
             found_files++;
         }
     }
@@ -633,14 +635,14 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
     uint8_t object_id =  GET_OBJECT_ID(obj_handle);
     LOG_DBG("\n\t\tObjHandle: 0x%x, SID: %x, OID: %x", mtp_command->param[0], storage_id, object_id);
 
-    if (available_storages[storage_id].fileslist[object_id].ID == obj_handle) {
-        char* filename = available_storages[storage_id].fileslist[object_id].name;
+    if (storage[storage_id].filelist[object_id].ID == obj_handle) {
+        char* filename = storage[storage_id].filelist[object_id].name;
         char* data_created = "20241001T220015";
         char* data_modified = "20241011T125813";
 
         net_buf_add_le32(buf, 0x00010001);                  /* StorageID */
 
-        if (available_storages[storage_id].fileslist[object_id].type == 1) {
+        if (storage[storage_id].filelist[object_id].type == 1) {
             net_buf_add_le16(buf, MTP_FORMAT_ASSOCIATION);  /* ObjectFormat */
         } else {
             net_buf_add_le16(buf, MTP_FORMAT_UNDEFINED);    /* ObjectFormat */
@@ -648,10 +650,10 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
 
         net_buf_add_le16(buf, OBJECT_PROTECTION_NO);        /* ProtectionStatus */
 
-        if (available_storages[storage_id].fileslist[object_id].type == 1){
+        if (storage[storage_id].filelist[object_id].type == 1){
             net_buf_add_le32(buf, 0xFFFFFFFFUL);            /* ObjectCompressedSize */
         } else {
-            net_buf_add_le32(buf, available_storages[storage_id].fileslist[object_id].size);
+            net_buf_add_le32(buf, storage[storage_id].filelist[object_id].size);
         }
         net_buf_add_le16(buf, 0);                           /* ThumbFormat */
         net_buf_add_le32(buf, 0);                           /* ThumbCompressedSize */
@@ -660,14 +662,14 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
         net_buf_add_le32(buf, 0);                           /* ImagePixWidth */
         net_buf_add_le32(buf, 0);                           /* ImagePixHeight */
         net_buf_add_le32(buf, 0);                           /* ImageBitDepth */
-        if (available_storages[storage_id].fileslist[object_id].parent_id == 0xff) {
-            LOG_DBG("%s in root", available_storages[storage_id].fileslist[object_id].name);
+        if (storage[storage_id].filelist[object_id].parent_id == 0xff) {
+            LOG_DBG("%s in root", storage[storage_id].filelist[object_id].name);
             net_buf_add_le32(buf, 0xFFFFFFFFUL);            /* ParentObject (0xFF if Object in Root) */
         } else {
             LOG_DBG("%s in parent %x",
-                    available_storages[storage_id].fileslist[object_id].name,
-                    available_storages[storage_id].fileslist[object_id].parent_id);
-            net_buf_add_le32(buf, available_storages[storage_id].fileslist[object_id].parent_id);                    /* ParentObject */
+                    storage[storage_id].filelist[object_id].name,
+                    storage[storage_id].filelist[object_id].parent_id);
+            net_buf_add_le32(buf, storage[storage_id].filelist[object_id].parent_id);                    /* ParentObject */
         }
         net_buf_add_le16(buf, 0x0001);                      /* AssociationType */
         net_buf_add_le32(buf, 0);                           /* AssociationDesc */
@@ -778,11 +780,11 @@ static int continue_get_object(struct net_buf *buf)
 int traverse_path(struct fs_object_t* obj, uint8_t* buf)
 {
     if (obj->parent_id != 0xff) {
-        int off = traverse_path(&available_storages[obj->storage_id].fileslist[obj->parent_id], buf);
+        int off = traverse_path(&storage[obj->storage_id].filelist[obj->parent_id], buf);
         return snprintf(&buf[off], MAX_PATH_LEN, "%s", obj->name);
     } else {
         return snprintf(buf, MAX_PATH_LEN, "%s/%s%s",
-                    available_storages[obj->storage_id].mountpoint,
+                    storage[obj->storage_id].mountpoint,
                     obj->name,
                     (obj->type == FS_DIR_ENTRY_DIR) ? "/" : "");
     }
@@ -799,11 +801,11 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     uint8_t storage_id = GET_STORAGE_ID(obj_handle);
     uint8_t object_id =  GET_OBJECT_ID(obj_handle);
 #if STORE_OBJECT_PATH
-    const char* path = available_storages[storage_id].fileslist[object_id].path;
+    const char* path = storage[storage_id].filelist[object_id].path;
 #else
     char path[MAX_PATH_LEN];
     memset(path, 0x00, MAX_PATH_LEN);
-    traverse_path(&available_storages[storage_id].fileslist[object_id], path);
+    traverse_path(&storage[storage_id].filelist[object_id], path);
     LOG_DBG(">>>> Traversed Path: %s", path);
 #endif
     fs_file_t_init(&mtp_ctx.filestate.file);
@@ -813,17 +815,17 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
 		return;
 	}
 
-    uint32_t filesize = available_storages[storage_id].fileslist[object_id].size;
+    uint32_t filesize = storage[storage_id].filelist[object_id].size;
     uint32_t available_buf_len = MAX_PACKET_SIZE-sizeof(struct mtp_header);
 
     LOG_DBG("Sending file: %s size: %u",
                 path,
-                available_storages[storage_id].fileslist[object_id].size);
+                storage[storage_id].filelist[object_id].size);
 
     /* Add the Packet Header */
-    data_header_push(buf, mtp_command, available_storages[storage_id].fileslist[object_id].size);
+    data_header_push(buf, mtp_command, storage[storage_id].filelist[object_id].size);
 
-    if (available_storages[storage_id].fileslist[object_id].size > available_buf_len) {
+    if (storage[storage_id].filelist[object_id].size > available_buf_len) {
         int read = fs_read(&mtp_ctx.filestate.file, mtp_ctx.filebuf, available_buf_len);
         if (read <= 0) {
             LOG_ERR("Failed to read file content %d", read);
@@ -860,11 +862,11 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
         uint32_t dest_storage_id = mtp_command->param[0] & 0x0F;
         uint32_t dest_parent_handle = mtp_command->param[1];
 
-        if (dest_storage_id != 0 && dest_storage_id < ARRAY_SIZE(available_storages)) {
-            if ((available_storages[dest_storage_id].files_count + 1) <  MAX_FILES)
+        if (dest_storage_id != 0 && dest_storage_id < ARRAY_SIZE(storage)) {
+            if ((storage[dest_storage_id].files_count + 1) <  MAX_FILES)
             {
-                uint32_t new_obj_id = available_storages[dest_storage_id].files_count++;
-                fs_obj = &available_storages[dest_storage_id].fileslist[new_obj_id];
+                uint32_t new_obj_id = storage[dest_storage_id].files_count++;
+                fs_obj = &storage[dest_storage_id].filelist[new_obj_id];
 
                 fs_obj->object_id = new_obj_id;
                 fs_obj->type = 0;
@@ -874,7 +876,7 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
                 LOG_INF("New ObjID:  0x%08x", fs_obj->ID);
                 set_needs_more_data(true);
             } else {
-                LOG_ERR("No file handle avaiable %u", available_storages[dest_storage_id].files_count);
+                LOG_ERR("No file handle avaiable %u", storage[dest_storage_id].files_count);
             }
         } else {
             LOG_ERR("Unkown storage id %x", dest_storage_id);
@@ -920,17 +922,17 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
         net_buf_pull_u8(payload);                                          /* KeywordsLength, always 0 unused */
 
         if (fs_obj->parent_id==0xff){
-            snprintf(filepath, MAX_PATH_LEN, "%s/%s", available_storages[fs_obj->storage_id].mountpoint, filename);
+            snprintf(filepath, MAX_PATH_LEN, "%s/%s", storage[fs_obj->storage_id].mountpoint, filename);
         } else {
-            printk("mnt: %s\n", available_storages[fs_obj->storage_id].mountpoint);
+            printk("mnt: %s\n", storage[fs_obj->storage_id].mountpoint);
             printk("fname: %s\n",filename);
             printk("parentID: %u\n",fs_obj->parent_id);
             printf("parentPath:%s\n",
-                    available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].name);
+                    storage[fs_obj->storage_id].filelist[fs_obj->parent_id].name);
 
             snprintf(filepath, MAX_PATH_LEN, "%s/%s/%s",
-                    available_storages[fs_obj->storage_id].mountpoint,
-                    available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].name,
+                    storage[fs_obj->storage_id].mountpoint,
+                    storage[fs_obj->storage_id].filelist[fs_obj->parent_id].name,
                     filename);
         }
 
@@ -957,7 +959,7 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
                 .transaction_id = mtp_command->hdr.transaction_id,
             },
             .param[0] = INTERNAL_STORAGE_ID(fs_obj->storage_id),
-            .param[1] = (fs_obj->parent_id == 0xff ? 0xffffffff : available_storages[fs_obj->storage_id].fileslist[fs_obj->parent_id].ID),
+            .param[1] = (fs_obj->parent_id == 0xff ? 0xffffffff : storage[fs_obj->storage_id].filelist[fs_obj->parent_id].ID),
             .param[2] = fs_obj->ID
         };
         LOG_INF("Sent info: \n\tSID: %x\n\tPID: %x\n\tOID: %x",
@@ -977,7 +979,7 @@ int extra_data_handler(struct net_buf* buf,struct net_buf* buf_recv)
     if (mtp_ctx.filestate.transferred >= mtp_ctx.filestate.total_size) {
         fs_close(&mtp_ctx.filestate.file);
         LOG_INF("Sending Confirmation after reciving data (Total len: %u)", mtp_ctx.filestate.transferred);
-        LOG_INF("Old filecount %u", available_storages[1].files_count);
+        LOG_INF("Old filecount %u", storage[1].files_count);
 
         mtp_ctx.filestate.chunks_sent=0;
         mtp_ctx.filestate.transferred=0;
@@ -1014,11 +1016,11 @@ MTP_CMD_HANDLER(MTP_OP_DELETE_OBJECT)
     uint32_t storage_id = GET_STORAGE_ID(mtp_command->param[0]);
     uint32_t object_id = GET_OBJECT_ID(mtp_command->param[0]);
 #if STORE_OBJECT_PATH
-    char* filepath = available_storages[storage_id].fileslist[object_id].path;
+    char* filepath = storage[storage_id].filelist[object_id].path;
 #else
     char filepath[MAX_PATH_LEN];
     memset(filepath, 0x00, MAX_PATH_LEN);
-    traverse_path(&available_storages[storage_id].fileslist[object_id], filepath);
+    traverse_path(&storage[storage_id].filelist[object_id], filepath);
     LOG_DBG(">>>> Traversed Path: %s", filepath);
 #endif
     fs_unlink(filepath);
@@ -1037,10 +1039,10 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_REFERENCES)
 {
     uint32_t objcount = 0;
 
-    for (int i=0; i < available_storages[1].files_count; i++) {
-        if (available_storages[1].fileslist[i].parent_id == 0xff) {
+    for (int i=0; i < storage[1].files_count; i++) {
+        if (storage[1].filelist[i].parent_id == 0xff) {
             objcount++;
-            net_buf_add_le32(buf, available_storages[1].fileslist[i].ID);
+            net_buf_add_le32(buf, storage[1].filelist[i].ID);
         }
     }
 
@@ -1075,10 +1077,9 @@ int mtp_commands_handler(struct net_buf *buf_in, struct net_buf *buf)
     case MTP_OP_GET_DEVICE_INFO:
         MTP_CMD(MTP_OP_GET_DEVICE_INFO);
     break;
-
     case MTP_OP_OPEN_SESSION:
         MTP_CMD(MTP_OP_OPEN_SESSION);
-        break;
+    break;
     case MTP_OP_CLOSE_SESSION:
         MTP_CMD(MTP_OP_CLOSE_SESSION);
     break;
