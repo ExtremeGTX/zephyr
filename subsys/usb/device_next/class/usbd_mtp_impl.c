@@ -165,7 +165,7 @@ char date_created[25];
 char date_modified[25];
 
 struct mtp_context {
-    uint8_t session_id;
+    bool session_opened;
     uint8_t filebuf[512]; /* TODO: should match USB Packet size */
     struct {
         struct fs_file_t file;
@@ -174,7 +174,9 @@ struct mtp_context {
         uint32_t chunks_sent;
         uint32_t storage_id;
     } filestate;
-} mtp_ctx;
+} mtp_ctx = {
+    .session_opened = false,
+};
 
 #define STORE_OBJECT_PATH 0
 
@@ -508,14 +510,28 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 
 MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
 {
-    for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
-        dir_traverse(i, available_storages[i].mountpoint, 0xFFFFFFFF);
+    uint16_t err_code = MTP_RESP_OK;
+
+    if (mtp_ctx.session_opened == false) {
+        for (int i=1; i < ARRAY_SIZE(storage); i++)
+        {
+            if (dir_traverse(i, storage[i].mountpoint, 0xFFFFFFFF)) {
+                LOG_ERR("Failed to traverse %s", storage[i].mountpoint);
+                err_code = MTP_RESP_GENERAL_ERROR;
+                break;
+            }
+            //TODO: Fail the MTP command if dir_traverse fails
+            mtp_ctx.session_opened = true;
+        }
+    } else {
+        LOG_ERR("Session already open");
+        err_code = MTP_RESP_SESSION_ALREADY_OPEN;
     }
 
     struct mtp_header mtp_response = {
         .length = sizeof(struct mtp_header),
         .type = MTP_CONTAINER_RESPONSE,
-        .code = MTP_RESP_OK,
+        .code = err_code,
         .transaction_id = mtp_command->hdr.transaction_id
     };
 
@@ -1151,41 +1167,48 @@ int mtp_init()
 {
 #if 0
     fs_unlink("/lfs1/desktop.ini");
-    LOG_INF("Found %u storages", ARRAY_SIZE(available_storages)-1);
+    LOG_INF("Found %u storage", ARRAY_SIZE(storage)-1);
 
-    for (int i=1; i < ARRAY_SIZE(available_storages); i++) {
-        if (available_storages[i].files_count != 1){
+    for (int i=1; i < ARRAY_SIZE(storage); i++) {
+        if (storage[i].files_count != 1){
             return 0;
         }
-        LOG_INF("Storage %u: %s", i, available_storages[i].mountpoint);
+        LOG_INF("Storage %u: %s", i, storage[i].mountpoint);
 
         struct fs_statvfs stat;
-        int err = fs_statvfs(available_storages[i].mountpoint, &stat);
+        int err = fs_statvfs(storage[i].mountpoint, &stat);
         if (err < 0) {
-            LOG_ERR("Failed to statvfs %s (%d)", available_storages[i].mountpoint, err);
+            LOG_ERR("Failed to statvfs %s (%d)", storage[i].mountpoint, err);
             return -ENOEXEC;
         }
 
         LOG_INF("Max capacity %lu, freesize %lu, blocks %lu, bfree %lu\n",
              stat.f_blocks * stat.f_frsize, stat.f_frsize * stat.f_bfree, stat.f_blocks, stat.f_bfree);
 
-        dir_traverse(i, available_storages[i].mountpoint, 0xFFFFFFFF);
+        dir_traverse(i, storage[i].mountpoint, 0xFFFFFFFF);
     }
 
-    for (int storageIdx=1; storageIdx< ARRAY_SIZE(available_storages); storageIdx++){
-        LOG_INF("File list Storage %s", available_storages[storageIdx].mountpoint);
-        for (int i=0;i<available_storages[storageIdx].files_count;i++)
+    for (int storageIdx=1; storageIdx< ARRAY_SIZE(storage); storageIdx++){
+        LOG_INF("File list Storage %s", storage[storageIdx].mountpoint);
+        for (int i=0;i<storage[storageIdx].files_count;i++)
         {
             LOG_INF("ID: 0x%08x S: %02x, P: %02x, T:%s, O: %02x : %s",
-                        available_storages[storageIdx].fileslist[i].ID,
-                        available_storages[storageIdx].fileslist[i].storage_id,
-                        available_storages[storageIdx].fileslist[i].parent_id,
-                        (available_storages[storageIdx].fileslist[i].type == 1 ? "D" : "f"),
-                        available_storages[storageIdx].fileslist[i].object_id,
-                        available_storages[storageIdx].fileslist[i].path);
+                        storage[storageIdx].filelist[i].ID,
+                        storage[storageIdx].filelist[i].storage_id,
+                        storage[storageIdx].filelist[i].parent_id,
+                        (storage[storageIdx].filelist[i].type == 1 ? "D" : "f"),
+                        storage[storageIdx].filelist[i].object_id,
+                        storage[storageIdx].filelist[i].path);
         }
         LOG_INF("\n\n");
     }
 #endif
+
+    for (int i=1; i < ARRAY_SIZE(storage); i++) {
+        memset(storage[i].filelist, 0x00, sizeof(storage[i].filelist));
+        storage[i].files_count = 0;
+    }
+    mtp_ctx.session_opened = false;
+
     return 0;
 }
