@@ -10,6 +10,7 @@
 #include <zephyr/net_buf.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/fs/fs.h>
+#include <zephyr/shell/shell.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
@@ -40,12 +41,49 @@ LOG_MODULE_REGISTER(usb_mtp_impl, 4); //CONFIG_USBD_MTP_LOG_LEVEL
 #define MTP_OP_GET_OBJECT_REFERENCES        0x9810
 
 /* MTP Response Codes */
-#define MTP_RESP_OK                         0x2001
-#define MTP_RESP_GENERAL_ERROR              0x2002
-#define MTP_RESP_SESSION_NOT_OPEN           0x2003
-#define MTP_RESP_OPERATION_NOT_SUPPORTED    0x2005
-#define MTP_RESP_SESSION_ALREADY_OPEN       0x201E
-#define MTP_RESP_INVALID_OBJECT_HANDLE      0x2009
+#define MTP_RESP_UNDEFINED                                  0x2000
+#define MTP_RESP_OK                                         0x2001
+#define MTP_RESP_GENERAL_ERROR                              0x2002
+#define MTP_RESP_SESSION_NOT_OPEN                           0x2003
+#define MTP_RESP_INVALID_TRANSACTION_ID                     0x2004
+#define MTP_RESP_OPERATION_NOT_SUPPORTED                    0x2005
+#define MTP_RESP_PARAMETER_NOT_SUPPORTED                    0x2006
+#define MTP_RESP_INCOMPLETE_TRANSFER                        0x2007
+#define MTP_RESP_INVALID_STORAGE_ID                         0x2008
+#define MTP_RESP_INVALID_OBJECT_HANDLE                      0x2009
+#define MTP_RESP_DEVICE_PROP_NOT_SUPPORTED                  0x200A
+#define MTP_RESP_INVALID_OBJECT_FORMAT_CODE                 0x200B
+#define MTP_RESP_STORAGE_FULL                               0x200C
+#define MTP_RESP_OBJECT_WRITE_PROTECTED                     0x200D
+#define MTP_RESP_STORE_READ_ONLY                            0x200E
+#define MTP_RESP_ACCESS_DENIED                              0x200F
+#define MTP_RESP_NO_THUMBNAIL_PRESENT                       0x2010
+#define MTP_RESP_SELF_TEST_FAILED                           0x2011
+#define MTP_RESP_PARTIAL_DELETION                           0x2012
+#define MTP_RESP_STORE_NOT_AVAILABLE                        0x2013
+#define MTP_RESP_SPECIFICATION_BY_FORMAT_UNSUPPORTED        0x2014
+#define MTP_RESP_NO_VALID_OBJECT_INFO                       0x2015
+#define MTP_RESP_INVALID_CODE_FORMAT                        0x2016
+#define MTP_RESP_UNKNOWN_VENDOR_CODE                        0x2017
+#define MTP_RESP_CAPTURE_ALREADY_TERMINATED                 0x2018
+#define MTP_RESP_DEVICE_BUSY                                0x2019
+#define MTP_RESP_INVALID_PARENT_OBJECT                      0x201A
+#define MTP_RESP_INVALID_DEVICE_PROP_FORMAT                 0x201B
+#define MTP_RESP_INVALID_DEVICE_PROP_VALUE                  0x201C
+#define MTP_RESP_INVALID_PARAMETER                          0x201D
+#define MTP_RESP_SESSION_ALREADY_OPEN                       0x201E
+#define MTP_RESP_TRANSACTION_CANCELLED                      0x201F
+#define MTP_RESP_SPECIFICATION_OF_DESTINATION_UNSUPPORTED   0x2020
+#define MTP_RESP_INVALID_OBJECT_PROP_CODE                   0xA801
+#define MTP_RESP_INVALID_OBJECT_PROP_FORMAT                 0xA802
+#define MTP_RESP_INVALID_OBJECT_PROP_VALUE                  0xA803
+#define MTP_RESP_INVALID_OBJECT_REFERENCE                   0xA804
+#define MTP_RESP_GROUP_NOT_SUPPORTED                        0xA805
+#define MTP_RESP_INVALID_DATASET                            0xA806
+#define MTP_RESP_SPECIFICATION_BY_GROUP_UNSUPPORTED         0xA807
+#define MTP_RESP_SPECIFICATION_BY_DEPTH_UNSUPPORTED         0xA808
+#define MTP_RESP_OBJECT_TOO_LARGE                           0xA809
+#define MTP_RESP_OBJECT_PROP_NOT_SUPPORTED                  0xA80A
 
 /* MTP Image Formats */
 #define MTP_FORMAT_UNDEFINED                0x3000
@@ -424,12 +462,9 @@ static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t pare
 
         // If it's a file, store the path in the array
         if (sstorage->files_count < MAX_FILES) {
-#if STORE_OBJECT_PATH
-            strncpy(sstorage->filelist[sstorage->files_count].path, path, MAX_PATH_LEN - 1);
-#endif
             strncpy(sstorage->filelist[sstorage->files_count].name, entry.name, MAX_PATH_LEN - 1);
             sstorage->filelist[sstorage->files_count].size = entry.size;
-            sstorage->filelist[sstorage->files_count].type = (entry.type == FS_DIR_ENTRY_DIR ? 1 : 0) ;
+            sstorage->filelist[sstorage->files_count].type = entry.type; /* FS_DIR_ENTRY_FILE=0 or FS_DIR_ENTRY_DIR=1 */
             sstorage->filelist[sstorage->files_count].parent_id = parent;
             sstorage->filelist[sstorage->files_count].object_id = sstorage->files_count;
             sstorage->filelist[sstorage->files_count].storage_id = storage_id;
@@ -437,19 +472,21 @@ static int dir_traverse(uint8_t storage_id, const char* root_path, uint32_t pare
 
             if (entry.type == FS_DIR_ENTRY_DIR) {
                 // Recursive call to traverse subdirectory
-                dir_traverse(storage_id, path, sstorage->filelist[sstorage->files_count-1].object_id);
+                err = dir_traverse(storage_id, path, sstorage->filelist[sstorage->files_count-1].object_id);
+                if(err) {
+                    LOG_ERR("Failed to traverse %s", path);
+                    break;
+                }
             }
-
         } else {
             LOG_ERR("Max file count reached, cannot store more paths.");
             break;
         }
-
     }
 
     fs_closedir(&dir);
 
-    return 0;
+    return err;
 }
 
 MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
@@ -656,7 +693,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
         char* data_created = "20241001T220015";
         char* data_modified = "20241011T125813";
 
-        net_buf_add_le32(buf, 0x00010001);                  /* StorageID */
+        net_buf_add_le32(buf, INTERNAL_STORAGE_ID(storage_id));                  /* StorageID */
 
         if (storage[storage_id].filelist[object_id].type == 1) {
             net_buf_add_le16(buf, MTP_FORMAT_ASSOCIATION);  /* ObjectFormat */
@@ -816,14 +853,12 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT)
     uint32_t obj_handle = mtp_command->param[0];
     uint8_t storage_id = GET_STORAGE_ID(obj_handle);
     uint8_t object_id =  GET_OBJECT_ID(obj_handle);
-#if STORE_OBJECT_PATH
-    const char* path = storage[storage_id].filelist[object_id].path;
-#else
+
     char path[MAX_PATH_LEN];
     memset(path, 0x00, MAX_PATH_LEN);
     traverse_path(&storage[storage_id].filelist[object_id], path);
     LOG_DBG(">>>> Traversed Path: %s", path);
-#endif
+
     fs_file_t_init(&mtp_ctx.filestate.file);
 	int err = fs_open(&mtp_ctx.filestate.file, path, FS_O_READ);
 	if (err) {
@@ -870,10 +905,11 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
     /* first packet received from Host contains only, destination storageID and Destination ParentID */
     if (fs_obj == NULL) {
         LOG_DBG("\n\t\tDest StorageID: 0x%x"
-                "\n\t\tDest ParentHandle: 0x%x, resolved 0x%x",
+                "\n\t\tDest ParentHandle: 0x%x, resolved 0x%x (%s)",
                 mtp_command->param[0],
                 mtp_command->param[1],
-                GET_OBJECT_ID(mtp_command->param[1]));
+                GET_OBJECT_ID(mtp_command->param[1]),
+                storage[GET_STORAGE_ID(mtp_command->param[0])].filelist[GET_OBJECT_ID(mtp_command->param[1])].name);
 
         uint32_t dest_storage_id = mtp_command->param[0] & 0x0F;
         uint32_t dest_parent_handle = mtp_command->param[1];
@@ -940,46 +976,54 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
         if (fs_obj->parent_id==0xff){
             snprintf(filepath, MAX_PATH_LEN, "%s/%s", storage[fs_obj->storage_id].mountpoint, filename);
         } else {
-            printk("mnt: %s\n", storage[fs_obj->storage_id].mountpoint);
-            printk("fname: %s\n",filename);
-            printk("parentID: %u\n",fs_obj->parent_id);
-            printf("parentPath:%s\n",
-                    storage[fs_obj->storage_id].filelist[fs_obj->parent_id].name);
-
             snprintf(filepath, MAX_PATH_LEN, "%s/%s/%s",
                     storage[fs_obj->storage_id].mountpoint,
                     storage[fs_obj->storage_id].filelist[fs_obj->parent_id].name,
                     filename);
         }
 
-        printk("\noFormat: %x, size: %x, parent: %x\n",
-                ObjectFormat, fs_obj->size, ParentObject);
-        printk("\nfname: %s\n",filename);
-        printk("\ncreated_on: %s\n", date_created);
-        printk("\nmodified_on: %s\n", date_modified);
-        printk("\npath: %s ID:%x\n", filepath, fs_obj->ID);
+        printk("\noFormat: %x, size: %x, parent: %x\n", ObjectFormat, fs_obj->size, ParentObject);
+        printk("mnt: %s\n", storage[fs_obj->storage_id].mountpoint);
+        printk("fname: %s\n",filename);
+        printk("created_on: %s\n", date_created);
+        printk("modified_on: %s\n", date_modified);
+        printk("path: %s ID:%x\n", filepath, fs_obj->ID);
+        printk("parentID: %u\n", fs_obj->parent_id);
+        printf("parentPath:%s\n", storage[fs_obj->storage_id].filelist[fs_obj->parent_id].name);
 
-        fs_file_t_init(&mtp_ctx.filestate.file);
-        int ret = fs_open(&mtp_ctx.filestate.file, filepath, FS_O_CREATE | FS_O_WRITE);
-        if (ret) {
-            LOG_ERR("Open file failed, %d", ret);
-            //TODO: Respond with error
+        if (fs_obj->type == FS_DIR_ENTRY_DIR) {
+            int ret = fs_mkdir(filepath);
+            if (ret) {
+                LOG_ERR("Failed to create directory %s (%d)", filepath, ret);
+                err_code = MTP_RESP_GENERAL_ERROR;
+            }
+        } else {
+            fs_file_t_init(&mtp_ctx.filestate.file);
+            int ret = fs_open(&mtp_ctx.filestate.file, filepath, FS_O_CREATE | FS_O_WRITE);
+            if (ret) {
+                LOG_ERR("Open file failed, %d", ret);
+                err_code = MTP_RESP_GENERAL_ERROR;
+            } else{
+                mtp_ctx.filestate.total_size = fs_obj->size;
+            }
         }
-        mtp_ctx.filestate.total_size = fs_obj->size;
 
+fail:
         struct mtp_container mtp_response = {
             .hdr = {
                 .length = 24,
                 .type = MTP_CONTAINER_RESPONSE,
-                .code = MTP_RESP_OK,
+                .code = err_code,
                 .transaction_id = mtp_command->hdr.transaction_id,
             },
             .param[0] = INTERNAL_STORAGE_ID(fs_obj->storage_id),
             .param[1] = (fs_obj->parent_id == 0xff ? 0xffffffff : storage[fs_obj->storage_id].filelist[fs_obj->parent_id].ID),
             .param[2] = fs_obj->ID
         };
+
         LOG_INF("Sent info: \n\tSID: %x\n\tPID: %x\n\tOID: %x",
             mtp_response.param[0],mtp_response.param[1],mtp_response.param[2]);
+
         net_buf_add_mem(buf, &mtp_response, 24);
         fs_obj = NULL;
     }
@@ -1017,29 +1061,95 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT)
         LOG_INF("DATA RECEIVED len: %u", payload->len); /* SKIP The header */
         net_buf_pull_mem(payload,sizeof(struct mtp_header));
         fs_write(&mtp_ctx.filestate.file, payload->data, payload->len);
-        extra_data_fn = extra_data_handler;
-        set_needs_more_data(true);
+
         mtp_ctx.filestate.chunks_sent++;
         mtp_ctx.filestate.transferred += payload->len;
         LOG_INF("SEND_OBJECT: Data len: %u out of %u", mtp_ctx.filestate.transferred, mtp_ctx.filestate.total_size);
+
+        if (mtp_ctx.filestate.transferred >= mtp_ctx.filestate.total_size)
+        {
+            fs_close(&mtp_ctx.filestate.file);
+            LOG_INF("SEND_OBJECT: Sending Confirmation after reciving data (Total len: %u)", mtp_ctx.filestate.transferred);
+            LOG_INF("SEND_OBJECT: Old filecount %u", storage[1].files_count);
+
+            mtp_ctx.filestate.chunks_sent=0;
+            mtp_ctx.filestate.transferred=0;
+            mtp_ctx.filestate.total_size=0;
+
+            mtp_send_confirmation(buf);
+            if (buf->len <= 0) {
+                LOG_ERR("Failed to send confirmation");
+            }
+        } else {
+            extra_data_fn = extra_data_handler;
+            set_needs_more_data(true);
+        }
+    }
+}
+
+
+static int delete_dir(char* dirpath)
+{
+	struct fs_dir_t dir;
+	int err;
+    char objpath[MAX_PATH_LEN*2];
+
+	fs_dir_t_init(&dir);
+
+	err = fs_opendir(&dir, dirpath);
+	if (err) {
+		LOG_ERR("Unable to open %s (err %d)", dirpath, err);
+		return -ENOEXEC;
+	}
+
+	while (1) {
+		struct fs_dirent entry;
+
+		err = fs_readdir(&dir, &entry);
+		if (err) {
+			break;
+		}
+
+		/* Check for end of directory listing */
+		if (entry.name[0] == '\0') {
+			break;
+		}
+
+        /* Build the full path of the file or directory */
+        if (entry.type == FS_DIR_ENTRY_DIR) {
+            snprintf(objpath, sizeof(objpath), "%s%s/", dirpath, entry.name);
+            delete_dir(objpath);
+        } else {
+            snprintf(objpath, sizeof(objpath), "%s%s", dirpath, entry.name);
+            fs_unlink(objpath);
+        }
+	}
+
+    if (!err) {
+        fs_closedir(&dir);
+        fs_unlink(dirpath);
     }
 
-    return;
+	return 0;
 }
 
 MTP_CMD_HANDLER(MTP_OP_DELETE_OBJECT)
 {
     uint32_t storage_id = GET_STORAGE_ID(mtp_command->param[0]);
     uint32_t object_id = GET_OBJECT_ID(mtp_command->param[0]);
-#if STORE_OBJECT_PATH
-    char* filepath = storage[storage_id].filelist[object_id].path;
-#else
-    char filepath[MAX_PATH_LEN];
-    memset(filepath, 0x00, MAX_PATH_LEN);
-    traverse_path(&storage[storage_id].filelist[object_id], filepath);
-    LOG_DBG(">>>> Traversed Path: %s", filepath);
-#endif
-    fs_unlink(filepath);
+
+    char path[MAX_PATH_LEN];
+    memset(path, 0x00, MAX_PATH_LEN);
+    traverse_path(&storage[storage_id].filelist[object_id], path);
+    LOG_DBG(">>>> Traversed Path: %s", path);
+
+    if (GET_TYPE(mtp_command->param[0]) == FS_DIR_ENTRY_DIR) {
+        LOG_DBG("Deleting directory %s", path);
+        delete_dir(path);
+    } else {
+        LOG_DBG("Deleting file %s", path);
+        fs_unlink(path);
+    }
 
     struct mtp_header mtp_response = {
         .length = sizeof(struct mtp_header),
@@ -1069,6 +1179,17 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_REFERENCES)
     set_pending_packet(mtp_send_confirmation);
 }
 
+MTP_CMD_HANDLER(MTP_OP_COPY_OBJECT)
+{
+    uint32_t object_id = GET_OBJECT_ID(mtp_command->param[0]);
+    uint32_t tstorage_id = GET_STORAGE_ID(mtp_command->param[1]);
+    uint32_t tobject_id = GET_OBJECT_ID(mtp_command->param[2]);
+    LOG_DBG("\n\t\tObjHandle: 0x%x, SID: %x, OID: %x"
+            "\n\t\tDestStorageID: 0x%x, DestObjHandle: 0x%x",
+            mtp_command->param[0], GET_STORAGE_ID(mtp_command->param[0]), object_id,
+            tstorage_id, tobject_id);
+}
+
 int mtp_commands_handler(struct net_buf *buf_in, struct net_buf *buf)
 {
     if (buf == NULL){
@@ -1083,12 +1204,12 @@ int mtp_commands_handler(struct net_buf *buf_in, struct net_buf *buf)
     //Leave skipping up to the command handler since we can't anticipate how many params should
     //be skipped
     //net_buf_pull_mem(buf_in, sizeof(struct mtp_header));
-    struct mtp_header* mtp_command = (struct mtp_header*)buf_in->data;
+    struct mtp_container* mtp_command = (struct mtp_container*)buf_in->data;
     struct net_buf *payload = buf_in;
 
-    LOG_DBG(GREEN "[%s]" RESET, mtp_code_to_string(mtp_command->code));
+    LOG_DBG(GREEN "[%s]" RESET, mtp_code_to_string(mtp_command->hdr.code));
 
-    switch(mtp_command->code)
+    switch(mtp_command->hdr.code)
     {
     case MTP_OP_GET_DEVICE_INFO:
         MTP_CMD(MTP_OP_GET_DEVICE_INFO);
@@ -1126,17 +1247,14 @@ int mtp_commands_handler(struct net_buf *buf_in, struct net_buf *buf)
     case MTP_OP_GET_DEVICE_PROP_DESC:
         MTP_CMD(MTP_OP_GET_DEVICE_PROP_DESC);
         break;
-    case MTP_OP_MOVE_OBJECT:
-        LOG_ERR("MTP_OP_MOVE_OBJECT Not Implemented!");
-        break;
     case MTP_OP_COPY_OBJECT:
-        LOG_ERR("MTP_OP_COPY_OBJECT Not Implemented!");
+        MTP_CMD(MTP_OP_COPY_OBJECT);
         break;
     case MTP_OP_GET_OBJECT_REFERENCES:
         MTP_CMD(MTP_OP_GET_OBJECT_REFERENCES);
         break;
     default:
-        LOG_ERR("Unknown cmd 0x%x!", mtp_command->code);
+        LOG_ERR("Unknown cmd 0x%x!", mtp_command->hdr.code);
     break;
     }
 
@@ -1187,21 +1305,6 @@ int mtp_init()
 
         dir_traverse(i, storage[i].mountpoint, 0xFFFFFFFF);
     }
-
-    for (int storageIdx=1; storageIdx< ARRAY_SIZE(storage); storageIdx++){
-        LOG_INF("File list Storage %s", storage[storageIdx].mountpoint);
-        for (int i=0;i<storage[storageIdx].files_count;i++)
-        {
-            LOG_INF("ID: 0x%08x S: %02x, P: %02x, T:%s, O: %02x : %s",
-                        storage[storageIdx].filelist[i].ID,
-                        storage[storageIdx].filelist[i].storage_id,
-                        storage[storageIdx].filelist[i].parent_id,
-                        (storage[storageIdx].filelist[i].type == 1 ? "D" : "f"),
-                        storage[storageIdx].filelist[i].object_id,
-                        storage[storageIdx].filelist[i].path);
-        }
-        LOG_INF("\n\n");
-    }
 #endif
 
     for (int i=1; i < ARRAY_SIZE(storage); i++) {
@@ -1212,3 +1315,30 @@ int mtp_init()
 
     return 0;
 }
+
+static int cmd_mtp_list(const struct shell *sh, size_t argc, char **argv)
+{
+    for (int storageIdx=1; storageIdx< ARRAY_SIZE(storage); storageIdx++){
+        LOG_INF("File list Storage %s", storage[storageIdx].mountpoint);
+        for (int i=0;i<storage[storageIdx].files_count;i++)
+        {
+            LOG_INF("ID: 0x%08x S: %02x, P: %02x, T:%s, O: %02x : %s",
+                        storage[storageIdx].filelist[i].ID,
+                        storage[storageIdx].filelist[i].storage_id,
+                        storage[storageIdx].filelist[i].parent_id,
+                        (storage[storageIdx].filelist[i].type == 1 ? "D" : "f"),
+                        storage[storageIdx].filelist[i].object_id,
+                        storage[storageIdx].filelist[i].name);
+        }
+        LOG_INF("\n\n");
+    }
+
+    return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_mtp,
+	SHELL_CMD_ARG(list, NULL, "Create directory", cmd_mtp_list, 1, 1),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_REGISTER(mtp, &sub_mtp, "USB MTP commands", NULL);
