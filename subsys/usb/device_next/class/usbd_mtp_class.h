@@ -56,23 +56,14 @@ struct mtp_object {
 };
 
 struct mtp_partition {
-	const char *mountpoint;
 	struct mtp_object objlist[MTP_MAX_FILES];
 	uint8_t files_count;
-	bool read_only;
-};
-
-struct mtp_device_info {
-	const char *manufacturer;
-	const char *model;
-	const char *device_version;
-	const char *serial_number;
 };
 
 struct mtp_context {
 	struct mtp_partition partitions[CONFIG_USBD_MTP_STORAGES_PER_INSTANCE + 1];
 	uint8_t partitions_count;
-	struct mtp_device_info dev_info;
+	const struct usbd_mtp_instance *dev_info;
 	bool session_opened;
 	uint32_t session_id;
 	uint32_t transaction_id;
