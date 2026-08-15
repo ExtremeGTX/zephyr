@@ -24,6 +24,8 @@
  * @brief MTP storage registration entry.
  */
 struct usbd_mtp_storage {
+	/** Storage label as presented over MTP. */
+	const char *label;
 	/** Filesystem mount point exposed through MTP. */
 	const char *mountpoint;
 	/** Whether the storage is exposed as read-only. */
@@ -43,7 +45,7 @@ struct usbd_mtp_instance {
 	/** MTP SerialNumber string. Must be a 32 character hexadecimal string. */
 	const char *serial_number;
 	/** Storages exposed by this MTP instance. */
-	const struct usbd_mtp_storage *storages;
+	struct usbd_mtp_storage *storages;
 	/** Number of storages exposed by this MTP instance. */
 	size_t storage_count;
 };
@@ -60,11 +62,13 @@ struct usbd_mtp_instance {
  *
  * Use this macro inside USBD_MTP_DEFINE_INSTANCE().
  *
+ * @param storage_label Storage label
  * @param storage_mountpoint Filesystem mount point
  * @param storage_read_only Whether the storage is exposed read-only
  */
-#define USBD_MTP_STORAGE_ENTRY(storage_mountpoint, storage_read_only)                              \
+#define USBD_MTP_STORAGE_ENTRY(storage_label, storage_mountpoint, storage_read_only)           \
 	{                                                                                          \
+		.label = storage_label,                                                            \
 		.mountpoint = storage_mountpoint,                                                  \
 		.read_only = storage_read_only,                                                    \
 	}
@@ -85,7 +89,7 @@ struct usbd_mtp_instance {
  */
 #define USBD_MTP_DEFINE_INSTANCE(id, mtp_manufacturer, mtp_product, mtp_device_version,            \
 				 mtp_serial_number, ...)                                           \
-	static const struct usbd_mtp_storage usbd_mtp_storages_##id[] = {__VA_ARGS__};             \
+	static struct usbd_mtp_storage usbd_mtp_storages_##id[] = {__VA_ARGS__};             \
 	BUILD_ASSERT(ARRAY_SIZE(usbd_mtp_storages_##id) <= CONFIG_USBD_MTP_STORAGES_PER_INSTANCE,  \
 		     "Too many MTP storages");                                                     \
 	static const STRUCT_SECTION_ITERABLE(usbd_mtp_instance, usbd_mtp_instance_##id) = {        \

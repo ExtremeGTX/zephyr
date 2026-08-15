@@ -566,7 +566,7 @@ static int traverse_path(struct mtp_context *ctx, struct mtp_object *obj, char *
 		ret = snprintf(&buf[off], MAX_OBJPATH_LEN - off, "/%s", obj->name);
 	} else {
 		ret = construct_path(buf, MAX_OBJPATH_LEN,
-				     ctx->partitions[obj->handle.partition_id].mountpoint,
+				     ctx->dev_info->storages[obj->handle.partition_id - 1].mountpoint,
 				     obj->name);
 	}
 
@@ -849,8 +849,6 @@ static int transfer_state_init(struct mtp_context *ctx, struct mtp_object *obj,
 
 MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 {
-	struct mtp_device_info *dev_info = &ctx->dev_info;
-
 	set_mtp_phase(ctx, MTP_PHASE_DATA);
 
 	/* Reserve space for MTP header at the beginning of the buffer */
@@ -882,13 +880,13 @@ MTP_CMD_HANDLER(MTP_OP_GET_DEVICE_INFO)
 	/* Playback formats supported */
 	mtp_buf_add_u16_array(buf, playback_formats, ARRAY_SIZE(playback_formats));
 
-	mtp_buf_add_string(buf, dev_info->manufacturer); /* manufacturer[] */
+	mtp_buf_add_string(buf, ctx->dev_info->manufacturer); /* manufacturer[] */
 
-	mtp_buf_add_string(buf, dev_info->model); /* model[] */
+	mtp_buf_add_string(buf, ctx->dev_info->product); /* model[] */
 
-	mtp_buf_add_string(buf, dev_info->device_version); /* device_version[] */
+	mtp_buf_add_string(buf, ctx->dev_info->device_version); /* device_version[] */
 
-	mtp_buf_add_string(buf, dev_info->serial_number); /* serial_number[] */
+	mtp_buf_add_string(buf, ctx->dev_info->serial_number); /* serial_number[] */
 
 	/* Add the Packet Header */
 	mtp_buf_push_data_header(ctx, buf, buf->len);
@@ -916,9 +914,9 @@ MTP_CMD_HANDLER(MTP_OP_OPEN_SESSION)
 
 	ctx->session_id = mtp_command->param[0];
 	for (int i = 1; i < ctx->partitions_count; i++) {
-		if (dir_traverse(ctx, i, ctx->partitions[i].mountpoint,
-				 MTP_ROOT_OBJ_HANDLE)) {
-			LOG_ERR("Failed to traverse %s", ctx->partitions[i].mountpoint);
+		const struct usbd_mtp_storage *storage = &ctx->dev_info->storages[i - 1];
+		if (dir_traverse(ctx, i, storage->mountpoint, MTP_ROOT_OBJ_HANDLE)) {
+			LOG_ERR("Failed to traverse %s", storage->mountpoint);
 			err_code = MTP_RESP_GENERAL_ERROR;
 			break;
 		}
@@ -970,30 +968,25 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 		return;
 	}
 
+	struct usbd_mtp_storage *storage = &ctx->dev_info->storages[partition_id - 1];
+
 	struct fs_statvfs stat;
-	int err = fs_statvfs(ctx->partitions[partition_id].mountpoint, &stat);
+	int err = fs_statvfs(storage->mountpoint, &stat);
 
 	if (err < 0) {
-		LOG_ERR("Failed to statvfs %s (%d)", ctx->partitions[partition_id].mountpoint, err);
+		LOG_ERR("Failed to statvfs %s (%d)", storage->mountpoint, err);
 		send_response_code(ctx, buf, MTP_RESP_GENERAL_ERROR);
 		return;
 	}
 
-	const char *storage_name = ctx->partitions[partition_id].mountpoint;
-
 	set_mtp_phase(ctx, MTP_PHASE_DATA);
-
-	if (storage_name[0] == '/') {
-		/* skip the slash */
-		storage_name++;
-	}
 
 	/* Reserve space for MTP header at the beginning of the buffer */
 	net_buf_reserve(buf, MTP_HEADER_SIZE);
 
 	net_buf_add_le16(buf, STORAGE_TYPE_FIXED_RAM);       /* type */
 	net_buf_add_le16(buf, FS_TYPE_GENERIC_HIERARCHICAL); /* fs_type */
-	if (ctx->partitions[partition_id].read_only) {
+	if (storage->read_only) {
 		net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY); /* access_caps */
 	} else {
 		net_buf_add_le16(buf, OBJECT_PROTECTION_NO);
@@ -1001,7 +994,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_STORAGE_INFO)
 	net_buf_add_le64(buf, fs_size_bytes(stat.f_blocks, stat.f_frsize)); /* max_capacity */
 	net_buf_add_le64(buf, fs_size_bytes(stat.f_bfree, stat.f_frsize));  /* free_space */
 	net_buf_add_le32(buf, MTP_FREE_SPACE_OBJ_UNUSED);                   /* free_space_obj */
-	mtp_buf_add_string(buf, storage_name);                              /* storage_desc[] */
+	mtp_buf_add_string(buf, storage->label);                              /* storage_desc[] */
 	net_buf_add_u8(buf, 0); /* volume_id_len, Unused */
 
 	/* Add the Packet Header */
@@ -1092,7 +1085,7 @@ MTP_CMD_HANDLER(MTP_OP_GET_OBJECT_INFO)
 	}
 
 	/* ProtectionStatus */
-	if (ctx->partitions[partition_id].read_only) {
+	if (ctx->dev_info->storages[partition_id - 1].read_only) {
 		net_buf_add_le16(buf, OBJECT_PROTECTION_READ_ONLY);
 	} else {
 		net_buf_add_le16(buf, OBJECT_PROTECTION_NO);
@@ -1289,7 +1282,9 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
 		goto exit;
 	}
 
-	if (ctx->partitions[dest_partition_id].read_only) {
+	const struct usbd_mtp_storage *storage = &ctx->dev_info->storages[dest_partition_id - 1];
+
+	if (storage->read_only) {
 		LOG_ERR("Storage %u is read-only", dest_partition_id);
 		err_code = MTP_RESP_STORE_READ_ONLY;
 		goto exit;
@@ -1364,10 +1359,9 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
 	}
 	/* Rest of props are ignored */
 
-	ret = fs_statvfs(ctx->partitions[dest_partition_id].mountpoint, &fs_stat);
+	ret = fs_statvfs(storage->mountpoint, &fs_stat);
 	if (ret < 0) {
-		LOG_ERR("Failed to statvfs %s (%d)", ctx->partitions[dest_partition_id].mountpoint,
-			ret);
+		LOG_ERR("Failed to statvfs %s (%d)", storage->mountpoint, ret);
 		err_code = MTP_RESP_GENERAL_ERROR;
 		goto exit;
 	}
@@ -1416,7 +1410,7 @@ MTP_CMD_HANDLER(MTP_OP_SEND_OBJECT_INFO)
 	LOG_DBG("\n ObjFormat: %x, size: %u, parent: %x\n mnt: %s\n fname: %s\n path: %s "
 		"Handle:%x\n parentID: %u",
 		object_format, new_obj->size, dest_parent_id,
-		ctx->partitions[new_obj->handle.partition_id].mountpoint, new_obj->name,
+		storage->mountpoint, new_obj->name,
 		ctx->transfer_state.filepath, new_obj->handle.value, new_obj->handle.parent_id);
 
 exit:
@@ -1538,7 +1532,7 @@ MTP_CMD_HANDLER(MTP_OP_DELETE_OBJECT)
 
 	LOG_DBG("Traversed Path: %s", path);
 
-	if (!ctx->partitions[partition_id].read_only) {
+	if (!ctx-> dev_info->storages[partition_id - 1].read_only) {
 #if defined(CONFIG_USBD_MTP_DISABLE_DIRECTORIES)
 		if (obj_handle.type == FS_DIR_ENTRY_DIR) {
 			LOG_WRN("Directory deletion rejected: directory support is "
@@ -1769,7 +1763,6 @@ static int mtp_storages_init(struct mtp_context *ctx, const struct usbd_mtp_inst
 	}
 
 	/* Reserve slot 0 as the internal root partition; real storages start at index 1. */
-	ctx->partitions[0].mountpoint = "NULL";
 	ctx->partitions_count = 1;
 
 	if (config == NULL) {
@@ -1792,20 +1785,11 @@ static int mtp_storages_init(struct mtp_context *ctx, const struct usbd_mtp_inst
 		return -ENOMEM;
 	}
 
-	ctx->dev_info = (struct mtp_device_info){
-		.manufacturer = config->manufacturer,
-		.model = config->product,
-		.device_version = config->device_version,
-		.serial_number = config->serial_number,
-	};
+	ctx->dev_info = config;
 
 	for (size_t i = 0; i < config->storage_count; i++) {
-		const struct usbd_mtp_storage *storage = &config->storages[i];
-
 		ctx->partitions[ctx->partitions_count] = (struct mtp_partition){
-			.mountpoint = storage->mountpoint,
 			.files_count = 1,
-			.read_only = storage->read_only,
 		};
 		ctx->partitions_count++;
 	}
